@@ -1,0 +1,2 @@
+obj-m := harddoom2.o
+harddoom2-objs := drv.o pci.o chardev.o buffer.o
