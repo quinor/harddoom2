@@ -16,7 +16,7 @@
 #define DOOMDEV_ADDRESS_LENGTH 40
 
 
-#define BOUNDS(min, max, elt) ((min) <= (elt) && (max) >= (elt))
+#define OOBOUNDS(min, max, elt) ((min) > (elt) || (max) < (elt))
 
 
 struct doomdevice
@@ -36,7 +36,9 @@ struct doomfile
 
 struct doombuffer
 {
-    uint32_t* pagetable;
+    uint32_t* dev_pagetable;
+    dma_addr_t dev_pagetable_handle;
+    void** usr_pagetable;
     uint32_t page_c;
     uint32_t size;
     // width and height only in use for the surface
@@ -55,7 +57,6 @@ int chardev_init(void);
 void chardev_exit(void);
 
 
-extern struct file_operations surface_fops;
 extern struct file_operations buffer_fops;
 
 

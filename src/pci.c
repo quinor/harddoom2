@@ -59,9 +59,9 @@ static int doomdev_probe (struct pci_dev *dev, const struct pci_device_id *dev_i
         goto err_dev_count;
     }
 
-    if (IS_ERR(doomdev = kmem_cache_alloc(doomdevice_cache, 0)))
+    if (0 == (doomdev = kmem_cache_alloc(doomdevice_cache, 0)))
     {
-        err = PTR_ERR(doomdev);
+        err = ENOMEM;
         goto err_cache_alloc;
     }
 

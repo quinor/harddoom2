@@ -39,9 +39,9 @@ static int doom_open(struct inode *ino, struct file *file)
     int err;
     struct doomfile* df;
 
-    if (IS_ERR(df = kmem_cache_alloc(doomfile_cache, 0)))
+    if (0 == (df = kmem_cache_alloc(doomfile_cache, 0)))
     {
-        err = PTR_ERR(df);
+        err = ENOMEM;
         goto err_cache_alloc;
     }
 
@@ -66,10 +66,28 @@ static int doom_release(struct inode *ino, struct file *file)
 }
 
 
+static int alloc_buffer_inode(struct doomfile* df, uint32_t size, uint32_t width, uint32_t height)
+{
+    struct doombuffer* buf;
+
+    if (0 == (buf = kmem_cache_alloc(doombuffer_cache, 0)))
+        return -ENOMEM;
+
+    buf->size = size;
+    buf->width = width;
+    buf->height = height;
+    buf->device = df->device;
+
+    return anon_inode_getfd("doom_buffer", &buffer_fops, buf, 0);
+}
+
+
 static long doom_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
     int err;
     struct doomfile* df;
+    uint32_t size, width, height;
+
     df = file->private_data;
 
     switch(cmd)
@@ -77,86 +95,52 @@ static long doom_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         case DOOMDEV2_IOCTL_CREATE_SURFACE:
         {
             struct doomdev2_ioctl_create_surface ioctl_surf;
-            struct doombuffer* buf;
             if ((err = copy_from_user(
                 &ioctl_surf,
                 (const void __user *)arg,
                 sizeof(struct doomdev2_ioctl_create_surface))
             ))
-                goto b1_err_getuser;
+                return err;
+            size = ioctl_surf.width*ioctl_surf.height;
+            width = ioctl_surf.width;
+            height = ioctl_surf.height;
 
-            if (IS_ERR(buf = kmem_cache_alloc(doombuffer_cache, 0)))
-            {
-                err = PTR_ERR(df);
-                goto b1_err_cache_alloc;
-            }
-
-            buf->size = ioctl_surf.width*ioctl_surf.height;
-            buf->width = ioctl_surf.width;
-            buf->height = ioctl_surf.height;
-            buf->device = df->device;
-
-            if (!(
-                BOUNDS(1, 2048, buf->width) &&
-                BOUNDS(1, 2048, buf->height) &&
-                ((buf->width&63) == 0)
-            ))
-            {
-                err = -EINVAL;
-                goto b1_err_out_of_bounds;
-            }
-
-            return anon_inode_getfd("doom_surface", &surface_fops, buf, 0);
-
-        b1_err_out_of_bounds:
-            kmem_cache_free(doombuffer_cache, buf);
-        b1_err_cache_alloc:
-        b1_err_getuser:
-            return err;
+            if (
+                OOBOUNDS(1, 2048, width) ||
+                OOBOUNDS(1, 2048, height) ||
+                ((width&63) != 0)
+            )
+                return -EINVAL;
+            return alloc_buffer_inode(df, size, width, height);
         }
         case DOOMDEV2_IOCTL_CREATE_BUFFER:
         {
             struct doomdev2_ioctl_create_buffer ioctl_buffer;
-            struct doombuffer* buf;
             if ((err = copy_from_user(
                 &ioctl_buffer,
                 (const void __user *)arg,
                 sizeof(struct doomdev2_ioctl_create_buffer))
             ))
-                goto b2_err_getuser;
+                return err;
 
-            if (IS_ERR(buf = kmem_cache_alloc(doombuffer_cache, 0)))
-            {
-                err = PTR_ERR(df);
-                goto b2_err_cache_alloc;
-            }
+            size = ioctl_buffer.size;
+            width = 0;
+            height = 0;
 
-            buf->size = ioctl_buffer.size;
-            buf->device = df->device;
+            if (OOBOUNDS(1, 2048*2048, size))
+                return -EINVAL;
 
-            if (!(BOUNDS(1, 2048*2048, buf->size)))
-            {
-                err = -EINVAL;
-                goto b2_err_out_of_bounds;
-            }
-
-            return anon_inode_getfd("doom_buffer", &buffer_fops, buf, 0);
-
-        b2_err_out_of_bounds:
-            kmem_cache_free(doombuffer_cache, buf);
-        b2_err_cache_alloc:
-        b2_err_getuser:
-            return err;
+            return alloc_buffer_inode(df, size, width, height);
         }
         case DOOMDEV2_IOCTL_SETUP:
         {
             // TODO
+            return -ENOTTY;
             break;
         }
         default:
             return -ENOTTY;
     }
-    return 0;
 }
 
 
@@ -178,8 +162,8 @@ int chardev_create(struct doomdevice* doomdev)
         "doom%d",
         doomdev->id
     );
-    if (IS_ERR(doomdev->chr_device))
-        return PTR_ERR(doomdev->chr_device);
+    if (0 == (doomdev->chr_device))
+        return ENOMEM;
     return 0;
 }
 
@@ -193,6 +177,13 @@ void chardev_destroy(struct doomdevice* doomdev)
 int chardev_init(void)
 {
     int err;
+
+    printk(
+        KERN_INFO DOOMHDR "ioctls: %x %x %x\n",
+        DOOMDEV2_IOCTL_CREATE_SURFACE,
+        DOOMDEV2_IOCTL_CREATE_BUFFER,
+        DOOMDEV2_IOCTL_SETUP
+    );
 
     // doomfile cache init
     doomfile_cache = KMEM_CACHE(doomfile, 0);
