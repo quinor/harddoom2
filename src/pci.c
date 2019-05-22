@@ -1,5 +1,4 @@
 #include "doomdriver.h"
-#include "harddoom2.h"
 #include "doomcode2.h"
 
 #include <linux/err.h>

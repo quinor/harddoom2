@@ -1,7 +1,6 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/err.h>
-#include "harddoom2.h"
 #include "doomdriver.h"
 
 MODULE_LICENSE("GPL v2");

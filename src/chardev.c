@@ -5,6 +5,7 @@
 #include <linux/cdev.h>
 #include <linux/anon_inodes.h>
 #include <linux/uaccess.h>
+#include <linux/file.h>
 
 static dev_t doom_major;
 
@@ -68,17 +69,65 @@ static int doom_release(struct inode *ino, struct file *file)
 
 static int alloc_buffer_inode(struct doomfile* df, uint32_t size, uint32_t width, uint32_t height)
 {
+    int err;
     struct doombuffer* buf;
+    struct file* file;
+    int fd;
 
     if (0 == (buf = kmem_cache_alloc(doombuffer_cache, 0)))
-        return -ENOMEM;
+    {
+        err = ENOMEM;
+        goto err_cache_alloc;
+    }
 
     buf->size = size;
     buf->width = width;
     buf->height = height;
+    mutex_init(&buf->lock);
     buf->device = df->device;
 
-    return anon_inode_getfd("doom_buffer", &buffer_fops, buf, 0);
+    if ((err = alloc_pagetable(buf)))
+        goto err_alloc_pagetable;
+
+    if ((fd = get_unused_fd_flags(O_RDWR)) < 0)
+    {
+        err = -fd;
+        goto err_get_fd;
+    }
+
+    if (IS_ERR(file = anon_inode_getfile("doom_buffer", &buffer_fops, buf, O_RDWR)))
+    {
+        err = PTR_ERR(file);
+        goto err_file;
+    }
+    file->f_mode |= FMODE_LSEEK | FMODE_PREAD | FMODE_PWRITE;
+
+    fd_install(fd, file);
+
+    BUG_ON(buf->page_c == 0);
+    BUG_ON(buf->size == 0);
+    BUG_ON(buf->dev_pagetable == 0);
+    BUG_ON(buf->dev_pagetable_handle == 0);
+    BUG_ON(buf->usr_pagetable == 0);
+
+    return fd;
+
+err_file:
+
+    put_unused_fd(fd);
+err_get_fd:
+
+    free_pagetable(buf);
+err_alloc_pagetable:
+
+    kmem_cache_free(doombuffer_cache, buf);
+err_cache_alloc:
+    return -err;
+}
+
+void destroy_buffer(struct doombuffer* buf)
+{
+    kmem_cache_free(doombuffer_cache, buf);
 }
 
 
@@ -90,6 +139,8 @@ static long doom_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
     df = file->private_data;
 
+    // printk(KERN_INFO DOOMHDR "got IOCTL %d\n", cmd);
+
     switch(cmd)
     {
         case DOOMDEV2_IOCTL_CREATE_SURFACE:
@@ -100,10 +151,13 @@ static long doom_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
                 (const void __user *)arg,
                 sizeof(struct doomdev2_ioctl_create_surface))
             ))
-                return err;
+                return -err;
             size = ioctl_surf.width*ioctl_surf.height;
             width = ioctl_surf.width;
             height = ioctl_surf.height;
+
+            if (size > 2048*2048)
+                return -EOVERFLOW;
 
             if (
                 OOBOUNDS(1, 2048, width) ||
@@ -121,11 +175,14 @@ static long doom_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
                 (const void __user *)arg,
                 sizeof(struct doomdev2_ioctl_create_buffer))
             ))
-                return err;
+                return -err;
 
             size = ioctl_buffer.size;
             width = 0;
             height = 0;
+
+            if (size > 2048*2048)
+                return -EOVERFLOW;
 
             if (OOBOUNDS(1, 2048*2048, size))
                 return -EINVAL;
@@ -135,6 +192,7 @@ static long doom_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         case DOOMDEV2_IOCTL_SETUP:
         {
             // TODO
+            return 0;
             return -ENOTTY;
             break;
         }
@@ -144,10 +202,25 @@ static long doom_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 }
 
 
-ssize_t doom_write(struct file *file, const char __user *user_data, size_t size, loff_t *off)
+ssize_t doom_write(struct file *file, const char __user *user_data, size_t count, loff_t *off)
 {
-    // TODO
-    return 0;
+    int ret;
+    struct doomfile* df;
+
+    df = file->private_data;
+
+    mutex_lock(&df->device->lock);
+
+    if (count % sizeof(struct doomdev2_cmd) != 0)
+    {
+        ret = -EINVAL;
+        goto err_end;
+    }
+    // TODO: run commands
+
+err_end:
+    mutex_unlock(&df->device->lock);
+    return count;
 }
 
 
@@ -178,13 +251,6 @@ int chardev_init(void)
 {
     int err;
 
-    printk(
-        KERN_INFO DOOMHDR "ioctls: %x %x %x\n",
-        DOOMDEV2_IOCTL_CREATE_SURFACE,
-        DOOMDEV2_IOCTL_CREATE_BUFFER,
-        DOOMDEV2_IOCTL_SETUP
-    );
-
     // doomfile cache init
     doomfile_cache = KMEM_CACHE(doomfile, 0);
     if (IS_ERR(doomfile_cache))
@@ -194,7 +260,7 @@ int chardev_init(void)
     }
 
     // doombuffer cache init
-    doombuffer_cache = KMEM_CACHE(doomfile, 0);
+    doombuffer_cache = KMEM_CACHE(doombuffer, 0);
     if (IS_ERR(doombuffer_cache))
     {
         err = PTR_ERR(doombuffer_cache);
