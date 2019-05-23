@@ -17,7 +17,7 @@
 
 #define DOOMDEV_REGISTER_SIZE 0x2000
 #define DOOMDEV_ADDRESS_LENGTH 40
-
+#define DOOMDEV_MAX_CMD_COUNT 0x1000 // 4096
 
 #define OOBOUNDS(min, max, elt) ((min) > (elt) || (max) < (elt))
 
@@ -37,20 +37,19 @@ struct doomdevice
 struct doomfile
 {
     union {
-        struct doombuffer* array[8];
+        struct doombuffer* array[7];
         struct {
-            struct doombuffer* surf_src;
             struct doombuffer* surf_dst;
+            struct doombuffer* surf_src;
             struct doombuffer* texture;
             struct doombuffer* flat;
             struct doombuffer* colormap;
             struct doombuffer* translation;
             struct doombuffer* tranmap;
-            struct doombuffer* cmd;
         } name;
     } buffers;
 
-    doombuffer* cmd;
+    struct doombuffer* cmd;
 
     struct mutex lock;
     struct doomdevice* device;
@@ -74,9 +73,8 @@ struct doombuffer
 
 
 extern struct doomdevice* devices[];
+extern struct kmem_cache* doombuffer_cache;
 
-
-void destroy_buffer(struct doombuffer* buf);
 
 int chardev_create(struct doomdevice* doomdev);
 void chardev_destroy(struct doomdevice* doomdev);
@@ -85,7 +83,7 @@ int chardev_init(void);
 void chardev_exit(void);
 
 
-int alloc_pagetable(struct doombuffer* buf);
+struct doombuffer* alloc_pagetable(struct doomdevice* device, uint32_t size, uint32_t width, uint32_t height);
 void free_pagetable(struct doombuffer* buf);
 
 extern struct file_operations buffer_fops;

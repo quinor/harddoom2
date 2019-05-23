@@ -4,7 +4,6 @@
 #include <linux/uaccess.h>
 
 
-static int buffer_open(struct inode *ino, struct file *file);
 static int buffer_release(struct inode *ino, struct file *filep);
 static ssize_t buffer_read(struct file *file, char __user *user_data, size_t size, loff_t *off);
 static ssize_t buffer_write(struct file *file, const char __user *user_data, size_t size, loff_t *off);
@@ -12,7 +11,6 @@ static loff_t buffer_llseek(struct file *file, loff_t off, int whence);
 
 struct file_operations buffer_fops = {
     .owner = THIS_MODULE,
-    .open = buffer_open,
     .read = buffer_read,
     .write = buffer_write,
     .llseek = buffer_llseek,
@@ -20,15 +18,27 @@ struct file_operations buffer_fops = {
 };
 
 
-int alloc_pagetable(struct doombuffer* buf)
+struct doombuffer* alloc_pagetable(struct doomdevice* device, uint32_t size, uint32_t width, uint32_t height)
 {
     int err;
-    int n_pages = (buf->size+PAGE_SIZE-1)/PAGE_SIZE;
+    struct doombuffer* buf;
+    int n_pages = (size+PAGE_SIZE-1)/PAGE_SIZE;
+
     dma_addr_t temp_handle;
 
-    // printk(KERN_INFO DOOMHDR "buffer at %lx\n", buf);
-    // printk(KERN_INFO DOOMHDR "allocating %d pages for a buffer of size %d\n", n_pages, buf->size);
-    // printk(KERN_INFO DOOMHDR "(W: %d, H: %d page_c: %d)\n", buf->width, buf->height, buf->page_c);
+    if (0 == (buf = kmem_cache_alloc(doombuffer_cache, 0)))
+    {
+        err = ENOMEM;
+        goto err_cache_alloc;
+    }
+
+    // printk(KERN_INFO DOOMHDR "doombuffer at  %lx\n", buf);
+
+    buf->size = size;
+    buf->width = width;
+    buf->height = height;
+    mutex_init(&buf->lock);
+    buf->device = device;
 
     if (0 == (buf->dev_pagetable = dma_alloc_coherent(
         &buf->device->pci_device->dev,
@@ -40,7 +50,6 @@ int alloc_pagetable(struct doombuffer* buf)
         err = ENOMEM;
         goto err_alloc_dev_pagetable;
     }
-    // printk(KERN_INFO DOOMHDR "allocated pagetable @%lx (cpu: %lx)\n", temp_handle, buf->dev_pagetable);
 
     buf->dev_pagetable_handle = temp_handle >> 8;
 
@@ -63,13 +72,11 @@ int alloc_pagetable(struct doombuffer* buf)
             err = ENOMEM;
             goto err_alloc_pages;
         }
-        // printk(KERN_INFO DOOMHDR "allocated page @%lx (cpu; %lx)\n", temp_handle, buf->usr_pagetable[buf->page_c]);
         buf->dev_pagetable[buf->page_c] = HARDDOOM2_PTE_VALID|HARDDOOM2_PTE_WRITABLE | (temp_handle >> 8);
         buf->page_c++;
     }
-    // printk(KERN_INFO DOOMHDR "allocated %d pages\n", buf->page_c);
 
-    return 0;
+    return buf;
 
 err_alloc_pages:
     while (buf->page_c)
@@ -94,19 +101,17 @@ err_alloc_usr_pagetable:
     );
 err_alloc_dev_pagetable:
 
-    return err;
+    kmem_cache_free(doombuffer_cache, buf);
+err_cache_alloc:
+
+    return ERR_PTR(err);
 }
 
 void free_pagetable(struct doombuffer* buf)
 {
-    // printk(KERN_INFO DOOMHDR "freeing %d pages (table@ %lx)\n", buf->page_c, buf->usr_pagetable);
     while (buf->page_c)
     {
         buf->page_c--;
-        // printk(KERN_INFO DOOMHDR "freeing page (usr)%lx (dev)%lx\n",
-        //     buf->usr_pagetable[buf->page_c],
-        //     (buf->dev_pagetable[buf->page_c] & HARDDOOM2_PTE_PHYS_MASK) << 8
-        // );
         dma_free_coherent(
             &buf->device->pci_device->dev,
             PAGE_SIZE,
@@ -115,14 +120,7 @@ void free_pagetable(struct doombuffer* buf)
         );
     }
 
-    // printk(KERN_INFO DOOMHDR "freeing pagetable %lx\n", buf->usr_pagetable);
-
     kfree(buf->usr_pagetable);
-
-    // printk(KERN_INFO DOOMHDR "freeing dev pagetable (usr)%lx (dev)%lx\n",
-    //     buf->dev_pagetable,
-    //     buf->dev_pagetable_handle << 8
-    // );
 
     dma_free_coherent(
         &buf->device->pci_device->dev,
@@ -130,22 +128,14 @@ void free_pagetable(struct doombuffer* buf)
         buf->dev_pagetable,
         buf->dev_pagetable_handle << 8
     );
-}
 
-
-static int buffer_open(struct inode *ino, struct file *file)
-{
-    return alloc_pagetable(file->private_data);
+    kmem_cache_free(doombuffer_cache, buf);
 }
 
 
 static int buffer_release(struct inode *ino, struct file *file)
 {
-    // printk(KERN_INFO DOOMHDR "Destruction part 1 @ %lx\n", file->private_data);
     free_pagetable(file->private_data);
-    // printk(KERN_INFO DOOMHDR "Destruction part 2\n");
-    destroy_buffer(file->private_data);
-    // printk(KERN_INFO DOOMHDR "Destruction part 3\n");
     return 0;
 }
 
@@ -157,9 +147,6 @@ static ssize_t buffer_read(struct file *file, char __user *user_data, size_t cou
     loff_t end;
     struct doombuffer* buf;
     ssize_t ret;
-
-    // printk(KERN_INFO DOOMHDR "reading from buffer...\n");
-    // printk(KERN_INFO DOOMHDR "file had modes %x\n", file->f_mode);
 
     buf = file->private_data;
 
@@ -223,35 +210,35 @@ static ssize_t buffer_write(struct file *file, const char __user *user_data, siz
     struct doombuffer* buf;
     ssize_t ret;
 
-    // printk(KERN_INFO DOOMHDR "writing to buffer...\n");
-
     buf = file->private_data;
 
-    // printk(KERN_INFO DOOMHDR "japa\n");
     mutex_lock(&buf->lock);
+
+    // printk(KERN_INFO DOOMHDR "write request of size %d...\n", count);
+    // printk(KERN_INFO DOOMHDR "buf stats: page_c %d, size %d, width %d, height %d\n",
+        // buf->page_c, buf->size, buf->width, buf->height);
+
     start = pos = *off;
 
-    // printk(KERN_INFO DOOMHDR "kurwa\n");
     if (pos < 0 || pos > buf->size)
     {
-        // printk(KERN_INFO DOOMHDR "write fail: position out of bounds\n");
+        // printk(KERN_INFO DOOMHDR "fail1\n");
         ret = -EFAULT;
         goto err_end;
     }
 
-    // printk(KERN_INFO DOOMHDR "dupa\n");
     if (count > buf->size - pos)
         count = buf->size - pos;
     end = pos + count;
 
     if (pos == end)
     {
-        // printk(KERN_INFO DOOMHDR "write fail: position at the end of the file\n");
+        // printk(KERN_INFO DOOMHDR "count: %d buf->size: %d pos: %d\n", count, buf->size, pos);
+        // printk(KERN_INFO DOOMHDR "fail2\n");
         ret = -EFAULT;
         goto err_end;
     }
 
-    // printk(KERN_INFO DOOMHDR "chuj\n");
     while (pos != end)
     {
         loff_t copy_end;
@@ -259,25 +246,18 @@ static ssize_t buffer_write(struct file *file, const char __user *user_data, siz
         if (copy_end > end)
             copy_end = end;
 
-        // printk(KERN_INFO DOOMHDR "pizda\n");
-        // printk(KERN_INFO DOOMHDR "copy @pos %lx to %lx from %lx elts %x",
-        //     pos,
-        //         buf->usr_pagetable[pos>>12]+(pos & (PAGE_SIZE-1)),
-        //     user_data+pos,
-        //     copy_end-pos
-        // );
         if ((ret = copy_from_user(
             buf->usr_pagetable[pos>>12]+(pos & (PAGE_SIZE-1)),
             user_data+pos,
             copy_end-pos
         )))
         {
-            // printk(KERN_INFO DOOMHDR "write fail: copy_from_user failed\n");
             *off = pos;
             if (pos != start)
                 ret = pos-start;
             else
                 ret = -EFAULT;
+            // printk(KERN_INFO DOOMHDR "fail3\n");
             goto err_end;
         }
 
@@ -287,7 +267,12 @@ static ssize_t buffer_write(struct file *file, const char __user *user_data, siz
 
     ret = pos-start;
 
+    // printk(KERN_INFO DOOMHDR "...wrote %d\n", ret);
+    mutex_unlock(&buf->lock);
+    return ret;
+
 err_end:
+    // printk(KERN_INFO DOOMHDR "failed with %d\n", ret);
     mutex_unlock(&buf->lock);
     return ret;
 }

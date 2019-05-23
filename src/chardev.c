@@ -1,5 +1,7 @@
 #include "doomdriver.h"
 #include "doomdev2.h"
+#include "harddoom2.h"
+#include "debug.h"
 
 #include <linux/err.h>
 #include <linux/cdev.h>
@@ -32,7 +34,7 @@ static struct file_operations doom_fops = {
 
 
 static struct kmem_cache* doomfile_cache;
-static struct kmem_cache* doombuffer_cache;
+struct kmem_cache* doombuffer_cache;
 
 
 static int doom_open(struct inode *ino, struct file *file)
@@ -49,12 +51,20 @@ static int doom_open(struct inode *ino, struct file *file)
 
     *df = aux; // zero everything. df->buffers == 0
     df->device = devices[MINOR(ino->i_rdev)];
+    mutex_init(&df->lock);
 
-    // TODO: cmd init
+    if (IS_ERR(df->cmd = alloc_pagetable(df->device, sizeof(cmd_t)*DOOMDEV_MAX_CMD_COUNT, 0, 0)))
+    {
+        err = PTR_ERR(df->cmd);
+        goto err_cmd_init;
+    }
 
     file->private_data = df;
 
     return 0;
+
+    free_pagetable(df->cmd);
+err_cmd_init:
 
     kmem_cache_free(doomfile_cache, df);
 err_cache_alloc:
@@ -73,6 +83,7 @@ static int doom_release(struct inode *ino, struct file *file)
         if (df->buffers.array[i] != 0)
             fput(df->buffers.array[i]->file);
 
+    free_pagetable(df->cmd);
     kmem_cache_free(doomfile_cache, df);
     return 0;
 }
@@ -85,20 +96,11 @@ static int alloc_buffer_inode(struct doomfile* df, uint32_t size, uint32_t width
     struct file* file;
     int fd;
 
-    if (0 == (buf = kmem_cache_alloc(doombuffer_cache, 0)))
+    if (IS_ERR(buf = alloc_pagetable(df->device, size, width, height)))
     {
-        err = ENOMEM;
-        goto err_cache_alloc;
-    }
-
-    buf->size = size;
-    buf->width = width;
-    buf->height = height;
-    mutex_init(&buf->lock);
-    buf->device = df->device;
-
-    if ((err = alloc_pagetable(buf)))
+        err = PTR_ERR(buf);
         goto err_alloc_pagetable;
+    }
 
     if ((fd = get_unused_fd_flags(O_RDWR)) < 0)
     {
@@ -126,8 +128,6 @@ err_get_fd:
     free_pagetable(buf);
 err_alloc_pagetable:
 
-    kmem_cache_free(doombuffer_cache, buf);
-err_cache_alloc:
     return -err;
 }
 
@@ -144,8 +144,6 @@ static long doom_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     uint32_t size, width, height;
 
     df = file->private_data;
-
-    // printk(KERN_INFO DOOMHDR "got IOCTL %d\n", cmd);
 
     switch(cmd)
     {
@@ -243,26 +241,179 @@ static long doom_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 }
 
 
+static void write_cmd(struct doombuffer* cmdbuf, cmd_t *command, size_t pos)
+{
+    cmd_t* page;
+
+    pos = pos*sizeof(cmd_t);
+    // printk(KERN_INFO DOOMHDR "cmd written to %lx (shifted %lx)\n", pos, pos >> 12);
+    page = (cmd_t*)(cmdbuf->usr_pagetable[pos >> 12]);
+    page[pos&(PAGE_SIZE-1)] = *command;
+}
+
+
+static int decode_cmd(struct doomfile* df, cmd_t* decoded_cmd, struct doomdev2_cmd* raw_cmd)
+{
+    // TODO: check params
+    int i;
+    for (i=0; i<8; i++)
+        decoded_cmd->w[i] = 0;
+
+    switch(raw_cmd->type)
+    {
+        case DOOMDEV2_CMD_TYPE_FILL_RECT:
+        {
+            decoded_cmd->w[0] = HARDDOOM2_CMD_W0(
+                HARDDOOM2_CMD_TYPE_FILL_RECT,
+                0
+            );
+            decoded_cmd->w[2] = HARDDOOM2_CMD_W2(
+                raw_cmd->fill_rect.pos_x,
+                raw_cmd->fill_rect.pos_y,
+                0
+            );
+            decoded_cmd->w[6] = HARDDOOM2_CMD_W6_A(
+                raw_cmd->fill_rect.width,
+                raw_cmd->fill_rect.height,
+                raw_cmd->fill_rect.fill_color
+            );
+            return 0;
+        }
+        case DOOMDEV2_CMD_TYPE_DRAW_LINE:
+        {
+            decoded_cmd->w[0] = HARDDOOM2_CMD_W0(
+                HARDDOOM2_CMD_TYPE_DRAW_LINE,
+                0
+            );
+            decoded_cmd->w[2] = HARDDOOM2_CMD_W2(
+                raw_cmd->draw_line.pos_a_x,
+                raw_cmd->draw_line.pos_a_y,
+                0
+            );
+            decoded_cmd->w[3] = HARDDOOM2_CMD_W3(
+                raw_cmd->draw_line.pos_b_x,
+                raw_cmd->draw_line.pos_b_y
+            );
+            decoded_cmd->w[6] = HARDDOOM2_CMD_W6_A(
+                0, 0,
+                raw_cmd->draw_line.fill_color
+            );
+            return 0;
+        }
+        default:
+        {
+            decoded_cmd->w[0] = HARDDOOM2_CMD_W0(HARDDOOM2_CMD_TYPE_SETUP, 0); // NOP
+            return 0;
+        }
+    }
+}
+
+struct doomdev2_cmd raw_cmds[DOOMDEV_MAX_CMD_COUNT-1];
+
 ssize_t doom_write(struct file *file, const char __user *user_data, size_t count, loff_t *off)
 {
-    int ret;
+    int i;
+    int err;
+    int cmd_c = 0;
     struct doomfile* df;
+    cmd_t cur_cmd = {0};
+    void __iomem* reg_enable;
+
+    // printk(KERN_INFO DOOMHDR "send attempt of %d\n", count);
 
     df = file->private_data;
 
-    mutex_lock(&df->device->lock);
-
     if (count % sizeof(struct doomdev2_cmd) != 0)
     {
-        ret = -EINVAL;
+        err = -EINVAL;
+        // printk(KERN_INFO DOOMHDR "fail1\n");
         goto err_end;
     }
-    // TODO: send setup
+
+    count /= sizeof(struct doomdev2_cmd);
+
+    if (count >= 1000)
+        printk(KERN_INFO DOOMHDR "big count is %d\n", count);
+    if (count >= DOOMDEV_MAX_CMD_COUNT)
+    {
+        count = DOOMDEV_MAX_CMD_COUNT-1;
+        printk(KERN_INFO DOOMHDR "truncated count to %d\n", count);
+    }
+
+    if ((err = -copy_from_user(
+        &raw_cmds,
+        user_data,
+        sizeof(struct doomdev2_cmd)*count
+    )))
+    {
+        // printk(KERN_INFO DOOMHDR "fail2\n");
+        goto err_end;
+    }
+
+    // decode setup
+    cur_cmd.w[0] = HARDDOOM2_CMD_W0_SETUP(
+        HARDDOOM2_CMD_TYPE_SETUP, //type
+
+        //flags
+        (df->buffers.name.surf_dst != 0 ? HARDDOOM2_CMD_FLAG_SETUP_SURF_DST : 0) |
+        (df->buffers.name.surf_src != 0 ? HARDDOOM2_CMD_FLAG_SETUP_SURF_SRC : 0) |
+        (df->buffers.name.texture != 0 ? HARDDOOM2_CMD_FLAG_SETUP_TEXTURE : 0) |
+        (df->buffers.name.flat != 0 ? HARDDOOM2_CMD_FLAG_SETUP_FLAT : 0) |
+        (df->buffers.name.translation != 0 ? HARDDOOM2_CMD_FLAG_SETUP_TRANSLATION : 0) |
+        (df->buffers.name.colormap != 0 ? HARDDOOM2_CMD_FLAG_SETUP_COLORMAP : 0) |
+        (df->buffers.name.tranmap != 0 ? HARDDOOM2_CMD_FLAG_SETUP_TRANMAP : 0) ,
+
+        df->buffers.name.surf_dst != 0 ? df->buffers.name.surf_dst->width : 0, //sdwidth
+        df->buffers.name.surf_src != 0 ? df->buffers.name.surf_src->width : 0 //sswidth
+    );
+    for (i=0; i<7; i++)
+        if (df->buffers.array[i] != 0)
+            cur_cmd.w[i+1] = df->buffers.array[i]->dev_pagetable_handle;
+
+    write_cmd(df->cmd, &cur_cmd, cmd_c++);
+
+    // printk(KERN_INFO DOOMHDR "count is %d, cmd_c is %d\n", count, cmd_c);
+
+    // decode rest of the commands
+    while (cmd_c <= count)
+    {
+        if ((err = -decode_cmd(df, &cur_cmd, &raw_cmds[cmd_c-1])))
+        {
+            // printk(KERN_INFO DOOMHDR "fail3\n");
+            goto err_end;
+        }
+        // printk(KERN_INFO DOOMHDR "args: %lx, %lx, %d\n", df->cmd, &cur_cmd, cmd_c);
+        write_cmd(df->cmd, &cur_cmd, cmd_c++);
+    }
+
+
+    mutex_lock(&df->device->lock);
+
+
+    iowrite32(df->cmd->dev_pagetable_handle, df->device->registers+HARDDOOM2_CMD_PT);
+    iowrite32(0, df->device->registers+HARDDOOM2_CMD_READ_IDX);
+    iowrite32(cmd_c, df->device->registers+HARDDOOM2_CMD_WRITE_IDX);
+
     // TODO: run commands
+    reg_enable = df->device->registers+HARDDOOM2_ENABLE;
+    iowrite32(HARDDOOM2_ENABLE_CMD_FETCH|ioread32(reg_enable), reg_enable);
+
+    if (ioread32(reg_enable) != HARDDOOM2_ENABLE_ALL)
+        printk(KERN_INFO DOOMHDR "registers enabled %lx\n", ioread32(reg_enable));
+
+    // TODO: wait for the ran commands
+    while (ioread32(df->device->registers+HARDDOOM2_CMD_READ_IDX) != cmd_c);
+
+    iowrite32((~HARDDOOM2_ENABLE_CMD_FETCH)&ioread32(reg_enable), reg_enable);
+    mutex_unlock(&df->device->lock);
+
+    // printk(KERN_INFO DOOMHDR "succeeded with %d\n", (cmd_c-1)*sizeof(struct doomdev2_cmd));
+    return (cmd_c-1)*sizeof(struct doomdev2_cmd);
 
 err_end:
-    mutex_unlock(&df->device->lock);
-    return count;
+
+    // printk(KERN_INFO DOOMHDR "failed with %d\n", err);
+    return err;
 }
 
 
