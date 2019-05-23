@@ -39,6 +39,7 @@ static int doom_open(struct inode *ino, struct file *file)
 {
     int err;
     struct doomfile* df;
+    struct doomfile aux = {0};
 
     if (0 == (df = kmem_cache_alloc(doomfile_cache, 0)))
     {
@@ -46,7 +47,11 @@ static int doom_open(struct inode *ino, struct file *file)
         goto err_cache_alloc;
     }
 
+    *df = aux; // zero everything. df->buffers == 0
     df->device = devices[MINOR(ino->i_rdev)];
+
+    // TODO: cmd init
+
     file->private_data = df;
 
     return 0;
@@ -59,8 +64,14 @@ err_cache_alloc:
 
 static int doom_release(struct inode *ino, struct file *file)
 {
+    int i;
     struct doomfile* df;
+
     df = file->private_data;
+
+    for (i=0; i<7; i++)
+        if (df->buffers.array[i] != 0)
+            fput(df->buffers.array[i]->file);
 
     kmem_cache_free(doomfile_cache, df);
     return 0;
@@ -101,14 +112,9 @@ static int alloc_buffer_inode(struct doomfile* df, uint32_t size, uint32_t width
         goto err_file;
     }
     file->f_mode |= FMODE_LSEEK | FMODE_PREAD | FMODE_PWRITE;
+    buf->file = file;
 
     fd_install(fd, file);
-
-    BUG_ON(buf->page_c == 0);
-    BUG_ON(buf->size == 0);
-    BUG_ON(buf->dev_pagetable == 0);
-    BUG_ON(buf->dev_pagetable_handle == 0);
-    BUG_ON(buf->usr_pagetable == 0);
 
     return fd;
 
@@ -149,8 +155,8 @@ static long doom_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
             if ((err = copy_from_user(
                 &ioctl_surf,
                 (const void __user *)arg,
-                sizeof(struct doomdev2_ioctl_create_surface))
-            ))
+                sizeof(struct doomdev2_ioctl_create_surface)
+            )))
                 return -err;
             size = ioctl_surf.width*ioctl_surf.height;
             width = ioctl_surf.width;
@@ -173,8 +179,8 @@ static long doom_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
             if ((err = copy_from_user(
                 &ioctl_buffer,
                 (const void __user *)arg,
-                sizeof(struct doomdev2_ioctl_create_buffer))
-            ))
+                sizeof(struct doomdev2_ioctl_create_buffer)
+            )))
                 return -err;
 
             size = ioctl_buffer.size;
@@ -191,10 +197,45 @@ static long doom_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         }
         case DOOMDEV2_IOCTL_SETUP:
         {
-            // TODO
-            return 0;
-            return -ENOTTY;
-            break;
+            uint32_t fds[7];
+            int i;
+
+            err = 0;
+            mutex_lock(&df->lock);
+
+            if ((err = copy_from_user(
+                &fds,
+                (const void __user *)arg,
+                sizeof(uint32_t)*7
+            )))
+                goto ioctl_fail;
+
+            for (i=0; i<7; i++)
+                if (fds[i] != -1)
+                {
+                    struct file* cur_file;
+                    if ((cur_file = fget(fds[i])) == NULL)
+                    {
+                        err = EINVAL;
+                        goto ioctl_fail;
+                    }
+
+                    if (cur_file->f_op != &buffer_fops)
+                    {
+                        fput(cur_file);
+                        err = EINVAL;
+                        goto ioctl_fail;
+                    }
+
+                    if (df->buffers.array[i] != 0)
+                        fput(df->buffers.array[i]->file);
+
+                    df->buffers.array[i] = cur_file->private_data;
+                }
+
+        ioctl_fail:
+            mutex_unlock(&df->lock);
+            return -err;
         }
         default:
             return -ENOTTY;
@@ -216,6 +257,7 @@ ssize_t doom_write(struct file *file, const char __user *user_data, size_t count
         ret = -EINVAL;
         goto err_end;
     }
+    // TODO: send setup
     // TODO: run commands
 
 err_end:

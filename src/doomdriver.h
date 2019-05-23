@@ -22,6 +22,9 @@
 #define OOBOUNDS(min, max, elt) ((min) > (elt) || (max) < (elt))
 
 
+typedef struct {uint32_t w[8];} cmd_t;
+
+
 struct doomdevice
 {
     int id;
@@ -33,6 +36,23 @@ struct doomdevice
 
 struct doomfile
 {
+    union {
+        struct doombuffer* array[8];
+        struct {
+            struct doombuffer* surf_src;
+            struct doombuffer* surf_dst;
+            struct doombuffer* texture;
+            struct doombuffer* flat;
+            struct doombuffer* colormap;
+            struct doombuffer* translation;
+            struct doombuffer* tranmap;
+            struct doombuffer* cmd;
+        } name;
+    } buffers;
+
+    doombuffer* cmd;
+
+    struct mutex lock;
     struct doomdevice* device;
 };
 
@@ -46,9 +66,12 @@ struct doombuffer
     // width and height only in use for the surface
     uint32_t width;
     uint32_t height;
+    struct file* file;
+
     struct mutex lock;
     struct doomdevice* device;
 };
+
 
 extern struct doomdevice* devices[];
 
