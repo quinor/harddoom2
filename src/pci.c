@@ -40,6 +40,25 @@ struct doomdevice* devices[MAX_DEVICE_COUNT];
 static struct kmem_cache* doomdevice_cache;
 
 
+irqreturn_t doomdev_irq_handler(int irq, void *dev)
+{
+    uint32_t intr;
+    struct doomdevice* doomdev;
+
+    doomdev = dev;
+
+    intr = ioread32(doomdev->registers + HARDDOOM2_INTR);
+    if (intr == 0)
+        return IRQ_NONE;
+
+    printk(KERN_INFO DOOMHDR "Interrupts caught: %lx\n", intr);
+
+    iowrite32(intr, doomdev->registers + HARDDOOM2_INTR);
+
+    return IRQ_HANDLED;
+}
+
+
 static int doomdev_probe (struct pci_dev *dev, const struct pci_device_id *dev_id)
 {
     int id;
@@ -91,7 +110,9 @@ static int doomdev_probe (struct pci_dev *dev, const struct pci_device_id *dev_i
         goto err_pci_dma_mask;
 
     // Interrupts
-    // TODO
+    if ((err = doomdev->irq_handle = request_irq(
+        doomdev->pci_device->irq, doomdev_irq_handler, IRQF_SHARED, DRIVER_NAME, dev)))
+        goto err_irq;
 
     // Boot the device
     iowrite32(0, doomdev->registers+HARDDOOM2_FE_CODE_ADDR);
@@ -100,8 +121,13 @@ static int doomdev_probe (struct pci_dev *dev, const struct pci_device_id *dev_i
 
     iowrite32(HARDDOOM2_RESET_ALL, doomdev->registers+HARDDOOM2_RESET);
     iowrite32(HARDDOOM2_INTR_MASK, doomdev->registers+HARDDOOM2_INTR);
+    iowrite32(HARDDOOM2_INTR_MASK ^ HARDDOOM2_INTR_FENCE ^ HARDDOOM2_INTR_PONG_ASYNC, doomdev->registers+HARDDOOM2_INTR_ENABLE);
     iowrite32(HARDDOOM2_ENABLE_ALL^HARDDOOM2_ENABLE_CMD_FETCH, doomdev->registers+HARDDOOM2_ENABLE);
-    iowrite32(0, doomdev->registers+HARDDOOM2_INTR); // TODO: add handled interrupts
+
+    if ((err = chardev_create(doomdev)))
+        goto err_chardev_create;
+
+    mutex_unlock(&doomdev->lock);
 
     printk(KERN_INFO DOOMHDR "Loaded device (vendor %x, dev %x) with ID %d\n",
         dev_id->vendor,
@@ -109,21 +135,17 @@ static int doomdev_probe (struct pci_dev *dev, const struct pci_device_id *dev_i
         id
     );
 
-    if ((err = chardev_create(doomdev)))
-        goto err_chardev_create;
-
-    mutex_unlock(&doomdev->lock);
-
     return 0;
 
     mutex_lock(&doomdev->lock);
     chardev_destroy(doomdev);
 
 err_chardev_create:
-    iowrite32(0, doomdev->registers+HARDDOOM2_INTR_ENABLE);
     iowrite32(0, doomdev->registers+HARDDOOM2_ENABLE);
-    ioread32(doomdev->registers+HARDDOOM2_FE_CODE_ADDR);
+    iowrite32(0, doomdev->registers+HARDDOOM2_INTR_ENABLE);
+    free_irq(doomdev->irq_handle, doomdev->pci_device);
 
+err_irq:
 err_pci_dma_mask:
     pci_clear_master(dev);
     pci_iounmap(dev, doomdev->registers);
@@ -160,7 +182,7 @@ static void doomdev_remove (struct pci_dev *dev)
 
     iowrite32(0, doomdev->registers+HARDDOOM2_INTR_ENABLE);
     iowrite32(0, doomdev->registers+HARDDOOM2_ENABLE);
-    ioread32(doomdev->registers+HARDDOOM2_FE_CODE_ADDR);
+    free_irq(doomdev->irq_handle, doomdev->pci_device);
 
     pci_clear_master(dev);
     pci_iounmap(dev, doomdev->registers);

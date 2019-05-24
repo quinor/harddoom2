@@ -195,6 +195,7 @@ static long doom_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         }
         case DOOMDEV2_IOCTL_SETUP:
         {
+            // TODO: repair partial fail?
             uint32_t fds[7];
             int i;
 
@@ -229,7 +230,14 @@ static long doom_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
                         fput(df->buffers.array[i]->file);
 
                     df->buffers.array[i] = cur_file->private_data;
+
+                    if (i<2 && df->buffers.array[i]->size == 0)
+                    {
+                        err = EINVAL;
+                        goto ioctl_fail;
+                    }
                 }
+
 
         ioctl_fail:
             mutex_unlock(&df->lock);
@@ -254,6 +262,9 @@ static void write_cmd(struct doombuffer* cmdbuf, cmd_t *command, size_t pos)
 
 static int decode_cmd(struct doomfile* df, cmd_t* decoded_cmd, struct doomdev2_cmd* raw_cmd)
 {
+    #define CHECK(cond) if(!(cond)) {return EINVAL;}
+
+    #define IN_SURFACE(x, y, surf) (0 <= (x) && (x) <= (surf)->width && 0 <= (y) && (y) <= (surf)->height)
     // TODO: check params
     int i;
     for (i=0; i<8; i++)
@@ -263,6 +274,18 @@ static int decode_cmd(struct doomfile* df, cmd_t* decoded_cmd, struct doomdev2_c
     {
         case DOOMDEV2_CMD_TYPE_FILL_RECT:
         {
+            CHECK(IN_SURFACE(
+                raw_cmd->fill_rect.pos_x,
+                raw_cmd->fill_rect.pos_y,
+                df->buffers.name.surf_dst
+            ))
+
+            CHECK(IN_SURFACE(
+                raw_cmd->fill_rect.pos_x+raw_cmd->fill_rect.width,
+                raw_cmd->fill_rect.pos_y+raw_cmd->fill_rect.height,
+                df->buffers.name.surf_dst
+            ))
+
             decoded_cmd->w[0] = HARDDOOM2_CMD_W0(
                 HARDDOOM2_CMD_TYPE_FILL_RECT,
                 0
@@ -281,6 +304,18 @@ static int decode_cmd(struct doomfile* df, cmd_t* decoded_cmd, struct doomdev2_c
         }
         case DOOMDEV2_CMD_TYPE_DRAW_LINE:
         {
+            CHECK(IN_SURFACE(
+                raw_cmd->draw_line.pos_a_x,
+                raw_cmd->draw_line.pos_a_y,
+                df->buffers.name.surf_dst
+            ))
+
+            CHECK(IN_SURFACE(
+                raw_cmd->draw_line.pos_b_x,
+                raw_cmd->draw_line.pos_b_y,
+                df->buffers.name.surf_dst
+            ))
+
             decoded_cmd->w[0] = HARDDOOM2_CMD_W0(
                 HARDDOOM2_CMD_TYPE_DRAW_LINE,
                 0
@@ -306,6 +341,9 @@ static int decode_cmd(struct doomfile* df, cmd_t* decoded_cmd, struct doomdev2_c
             return 0;
         }
     }
+
+    #undef CHECK
+    #undef IN_SURFACE
 }
 
 struct doomdev2_cmd raw_cmds[DOOMDEV_MAX_CMD_COUNT-1];
@@ -332,12 +370,12 @@ ssize_t doom_write(struct file *file, const char __user *user_data, size_t count
 
     count /= sizeof(struct doomdev2_cmd);
 
-    if (count >= 1000)
-        printk(KERN_INFO DOOMHDR "big count is %d\n", count);
+    // if (count >= 1000)
+    //     printk(KERN_INFO DOOMHDR "big count is %d\n", count);
     if (count >= DOOMDEV_MAX_CMD_COUNT)
     {
+        printk(KERN_INFO DOOMHDR "truncated count to %d from %d\n", DOOMDEV_MAX_CMD_COUNT-1, count);
         count = DOOMDEV_MAX_CMD_COUNT-1;
-        printk(KERN_INFO DOOMHDR "truncated count to %d\n", count);
     }
 
     if ((err = -copy_from_user(
@@ -379,7 +417,7 @@ ssize_t doom_write(struct file *file, const char __user *user_data, size_t count
     {
         if ((err = -decode_cmd(df, &cur_cmd, &raw_cmds[cmd_c-1])))
         {
-            // printk(KERN_INFO DOOMHDR "fail3\n");
+            printk(KERN_INFO DOOMHDR "fail3\n");
             goto err_end;
         }
         // printk(KERN_INFO DOOMHDR "args: %lx, %lx, %d\n", df->cmd, &cur_cmd, cmd_c);
@@ -399,7 +437,28 @@ ssize_t doom_write(struct file *file, const char __user *user_data, size_t count
     iowrite32(HARDDOOM2_ENABLE_CMD_FETCH|ioread32(reg_enable), reg_enable);
 
     if (ioread32(reg_enable) != HARDDOOM2_ENABLE_ALL)
-        printk(KERN_INFO DOOMHDR "registers enabled %lx\n", ioread32(reg_enable));
+    {
+        printk(KERN_INFO DOOMHDR "registers enabled %lx (fe error %lx)\n",
+            ioread32(reg_enable),
+            ioread32(df->device->registers+HARDDOOM2_FE_ERROR_CODE)
+        );
+        printk(KERN_INFO DOOMHDR "target surface of size %d by %d (size: %d)\n",
+            df->buffers.name.surf_dst->width,
+            df->buffers.name.surf_dst->height,
+            df->buffers.name.surf_dst->size
+        );
+
+        printk(KERN_INFO DOOMHDR "current command:\n\t%lx\n\t%lx\n\t%lx\n\t%lx\n\t%lx\n\t%lx\n\t%lx\n\t%lx\n",
+            ioread32(df->device->registers+HARDDOOM2_FE_REG(0)),
+            ioread32(df->device->registers+HARDDOOM2_FE_REG(1)),
+            ioread32(df->device->registers+HARDDOOM2_FE_REG(2)),
+            ioread32(df->device->registers+HARDDOOM2_FE_REG(3)),
+            ioread32(df->device->registers+HARDDOOM2_FE_REG(4)),
+            ioread32(df->device->registers+HARDDOOM2_FE_REG(5)),
+            ioread32(df->device->registers+HARDDOOM2_FE_REG(6)),
+            ioread32(df->device->registers+HARDDOOM2_FE_REG(7))
+        );
+    }
 
     // TODO: wait for the ran commands
     while (ioread32(df->device->registers+HARDDOOM2_CMD_READ_IDX) != cmd_c);

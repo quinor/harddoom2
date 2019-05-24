@@ -53,7 +53,7 @@ struct doombuffer* alloc_pagetable(struct doomdevice* device, uint32_t size, uin
 
     buf->dev_pagetable_handle = temp_handle >> 8;
 
-    if (0 == (buf->usr_pagetable = kmalloc(sizeof(void*)*n_pages, 0)))
+    if (0 == (buf->usr_pagetable = kmalloc(sizeof(uint8_t*)*n_pages, 0)))
     {
         err = ENOMEM;
         goto err_alloc_usr_pagetable;
@@ -177,7 +177,7 @@ static ssize_t buffer_read(struct file *file, char __user *user_data, size_t cou
             copy_end = end;
 
         if ((ret = copy_to_user(
-            user_data+pos,
+            user_data+pos-start,
             buf->usr_pagetable[pos>>12]+(pos & (PAGE_SIZE-1)),
             copy_end-pos
         )))
@@ -248,7 +248,7 @@ static ssize_t buffer_write(struct file *file, const char __user *user_data, siz
 
         if ((ret = copy_from_user(
             buf->usr_pagetable[pos>>12]+(pos & (PAGE_SIZE-1)),
-            user_data+pos,
+            user_data+pos-start,
             copy_end-pos
         )))
         {
