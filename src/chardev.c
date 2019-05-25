@@ -193,6 +193,7 @@ static long doom_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         {
             uint32_t fds[7];
             int i;
+            struct doombuffer* buf;
 
             err = 0;
             mutex_lock(&df->lock);
@@ -217,7 +218,9 @@ static long doom_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
                         goto ioctl_fail;
                     }
 
-                    if (cur_file->f_op != &buffer_fops)
+                    buf = cur_file->private_data;
+
+                    if (cur_file->f_op != &buffer_fops || buf->device != df->device)
                     {
                         fput(cur_file);
                         err = EINVAL;
