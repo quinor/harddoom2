@@ -51,9 +51,13 @@ irqreturn_t doomdev_irq_handler(int irq, void *dev)
     if (intr == 0)
         return IRQ_NONE;
 
-    printk(KERN_INFO DOOMHDR "Interrupts caught: %lx\n", intr);
-
     iowrite32(intr, doomdev->registers + HARDDOOM2_INTR);
+
+    if (intr & HARDDOOM2_INTR_PONG_SYNC)
+        up(&doomdev->wait_pong);
+
+    if (intr & (~HARDDOOM2_INTR_PONG_SYNC))
+        printk(KERN_INFO DOOMHDR "Interrupts caught: %x\n", intr);
 
     return IRQ_HANDLED;
 }
@@ -86,6 +90,7 @@ static int doomdev_probe (struct pci_dev *dev, const struct pci_device_id *dev_i
     doomdev->id = id;
     doomdev->pci_device = dev;
     mutex_init(&doomdev->lock);
+    sema_init(&doomdev->wait_pong, 0);
     devices[id] = doomdev;
     pci_set_drvdata(dev, doomdev);
 

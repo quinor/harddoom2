@@ -491,7 +491,7 @@ static int decode_cmd(struct doomfile* df, cmd_t* decoded_cmd, struct doomdev2_c
             decoded_cmd->w[5] = cur.ustep;
             decoded_cmd->w[6] = HARDDOOM2_CMD_W6_B(cur.texture_offset);
             decoded_cmd->w[7] = HARDDOOM2_CMD_W7_B(
-                (df->buffers.name.texture->size >> 6)-1,
+                (df->buffers.name.texture->size-1) >> 6,
                 cur.texture_height
             );
 
@@ -617,7 +617,6 @@ struct doomdev2_cmd raw_cmds[DOOMDEV_MAX_CMD_COUNT-1];
 
 ssize_t doom_write(struct file *file, const char __user *user_data, size_t count, loff_t *off)
 {
-    int i;
     int err;
     int cmd_c = 0;
     struct doomfile* df;
@@ -685,21 +684,28 @@ ssize_t doom_write(struct file *file, const char __user *user_data, size_t count
     {
         if ((err = -decode_cmd(df, &cur_cmd, &raw_cmds[cmd_c-1])))
             goto err_end;
+
+         // last command
+        if (cmd_c == count)
+            cur_cmd.w[0] |= HARDDOOM2_CMD_FLAG_PING_SYNC;
+
         write_cmd(df->cmd, &cur_cmd, cmd_c++);
     }
 
     mutex_lock(&df->device->lock);
 
     iowrite32(df->cmd->dev_pagetable_handle, df->device->registers+HARDDOOM2_CMD_PT);
+    iowrite32(2*DOOMDEV_MAX_CMD_COUNT, df->device->registers+HARDDOOM2_CMD_SIZE);
     iowrite32(0, df->device->registers+HARDDOOM2_CMD_READ_IDX);
     iowrite32(cmd_c, df->device->registers+HARDDOOM2_CMD_WRITE_IDX);
 
     reg_enable = df->device->registers+HARDDOOM2_ENABLE;
+
     iowrite32(HARDDOOM2_ENABLE_CMD_FETCH|ioread32(reg_enable), reg_enable);
-
-    while (ioread32(df->device->registers+HARDDOOM2_CMD_READ_IDX) != cmd_c);
-
+    down(&df->device->wait_pong);
+    // TODO: check for fails
     iowrite32((~HARDDOOM2_ENABLE_CMD_FETCH)&ioread32(reg_enable), reg_enable);
+
     mutex_unlock(&df->device->lock);
 
     return (cmd_c-1)*sizeof(struct doomdev2_cmd);

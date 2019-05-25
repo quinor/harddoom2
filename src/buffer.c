@@ -177,6 +177,9 @@ static ssize_t buffer_read(struct file *file, char __user *user_data, size_t cou
         if (copy_end > end)
             copy_end = end;
 
+        BUG_ON((pos>>12) >= buf->page_c);
+        BUG_ON((pos & (PAGE_SIZE-1)) + copy_end-pos > 4096);
+
         if ((ret = copy_to_user(
             user_data+pos-start,
             buf->usr_pagetable[pos>>12]+(pos & (PAGE_SIZE-1)),
@@ -240,7 +243,7 @@ static ssize_t buffer_write(struct file *file, const char __user *user_data, siz
         if (copy_end > end)
             copy_end = end;
 
-        BUG_ON(pos>>12 >= buf->page_c);
+        BUG_ON((pos>>12) >= buf->page_c);
         BUG_ON((pos & (PAGE_SIZE-1)) + copy_end-pos > 4096);
 
         if ((ret = copy_from_user(

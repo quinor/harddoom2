@@ -8,6 +8,7 @@
 #include <linux/slab.h>
 #include <linux/cdev.h>
 #include <linux/mutex.h>
+#include <linux/semaphore.h>
 
 
 #define MAX_DEVICE_COUNT 256
@@ -32,6 +33,7 @@ struct doomdevice
     struct pci_dev* pci_device;
     struct device* chr_device;
     struct mutex lock;
+    struct semaphore wait_pong;
 };
 
 struct doomfile
