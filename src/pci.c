@@ -13,10 +13,6 @@ static int doomdev_probe (struct pci_dev *dev, const struct pci_device_id *id);
 
 static void doomdev_remove (struct pci_dev *dev);
 
-static int doomdev_suspend (struct pci_dev *dev, pm_message_t state);
-
-static int doomdev_resume (struct pci_dev *dev);
-
 static void doomdev_shutdown (struct pci_dev *dev);
 
 
@@ -30,8 +26,6 @@ static struct pci_driver drv = {
     .id_table = id_table,
     .probe = doomdev_probe,
     .remove = doomdev_remove,
-    .suspend = doomdev_suspend,
-    .resume = doomdev_resume,
     .shutdown = doomdev_shutdown,
 };
 
@@ -40,7 +34,7 @@ struct doomdevice* devices[MAX_DEVICE_COUNT];
 static struct kmem_cache* doomdevice_cache;
 
 
-irqreturn_t doomdev_irq_handler(int irq, void *dev)
+static irqreturn_t doomdev_irq_handler(int irq, void *dev)
 {
     uint32_t intr;
     struct doomdevice* doomdev;
@@ -122,6 +116,13 @@ static int doomdev_probe (struct pci_dev *dev, const struct pci_device_id *dev_i
         dev->irq, doomdev_irq_handler, IRQF_SHARED, DRIVER_NAME, doomdev)))
         goto err_irq;
 
+    // command pagetable
+    if (IS_ERR(doomdev->cmd = alloc_pagetable(doomdev, sizeof(cmd_t)*DOOMDEV_MAX_CMD_COUNT, 0, 0)))
+    {
+        err = PTR_ERR(doomdev->cmd);
+        goto err_cmd_init;
+    }
+
     // Boot the device
     iowrite32(0, doomdev->registers+HARDDOOM2_FE_CODE_ADDR);
     for (i=0; i<sizeof(doomcode2)/sizeof(uint32_t); i++)
@@ -130,7 +131,13 @@ static int doomdev_probe (struct pci_dev *dev, const struct pci_device_id *dev_i
     iowrite32(HARDDOOM2_RESET_ALL, doomdev->registers+HARDDOOM2_RESET);
     iowrite32(HARDDOOM2_INTR_MASK, doomdev->registers+HARDDOOM2_INTR);
     iowrite32(HARDDOOM2_INTR_MASK ^ HARDDOOM2_INTR_FENCE ^ HARDDOOM2_INTR_PONG_ASYNC, doomdev->registers+HARDDOOM2_INTR_ENABLE);
-    iowrite32(HARDDOOM2_ENABLE_ALL^HARDDOOM2_ENABLE_CMD_FETCH, doomdev->registers+HARDDOOM2_ENABLE);
+
+    iowrite32(doomdev->cmd->dev_pagetable_handle, doomdev->registers+HARDDOOM2_CMD_PT);
+    iowrite32(DOOMDEV_MAX_CMD_COUNT, doomdev->registers+HARDDOOM2_CMD_SIZE);
+    iowrite32(0, doomdev->registers+HARDDOOM2_CMD_READ_IDX);
+    iowrite32(0, doomdev->registers+HARDDOOM2_CMD_WRITE_IDX);
+
+    iowrite32(HARDDOOM2_ENABLE_ALL, doomdev->registers+HARDDOOM2_ENABLE);
 
     if ((err = chardev_create(doomdev)))
         goto err_chardev_create;
@@ -146,9 +153,13 @@ static int doomdev_probe (struct pci_dev *dev, const struct pci_device_id *dev_i
     return 0;
 
     mutex_lock(&doomdev->lock);
+
     chardev_destroy(doomdev);
 
 err_chardev_create:
+    free_pagetable(doomdev->cmd);
+
+err_cmd_init:
     iowrite32(0, doomdev->registers+HARDDOOM2_ENABLE);
     iowrite32(0, doomdev->registers+HARDDOOM2_INTR_ENABLE);
     free_irq(dev->irq, doomdev);
@@ -188,6 +199,8 @@ static void doomdev_remove (struct pci_dev *dev)
 
     chardev_destroy(doomdev);
 
+    free_pagetable(doomdev->cmd);
+
     iowrite32(0, doomdev->registers+HARDDOOM2_INTR_ENABLE);
     iowrite32(0, doomdev->registers+HARDDOOM2_ENABLE);
     free_irq(dev->irq, doomdev);
@@ -207,34 +220,6 @@ static void doomdev_remove (struct pci_dev *dev)
     mutex_unlock(&global_driver_lock);
 
     printk(KERN_INFO DOOMHDR "Removed device with ID %d\n", id);
-}
-
-
-static int doomdev_suspend (struct pci_dev *dev, pm_message_t state)
-{
-    struct doomdevice* doomdev;
-    doomdev = pci_get_drvdata(dev);
-
-    mutex_lock(&global_driver_lock);
-
-    // TODO
-
-    mutex_unlock(&global_driver_lock);
-    return 0;
-}
-
-
-static int doomdev_resume (struct pci_dev *dev)
-{
-    struct doomdevice* doomdev;
-    doomdev = pci_get_drvdata(dev);
-
-    mutex_lock(&global_driver_lock);
-
-    // TODO
-
-    mutex_unlock(&global_driver_lock);
-    return 0;
 }
 
 

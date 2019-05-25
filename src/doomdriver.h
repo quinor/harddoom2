@@ -30,8 +30,11 @@ struct doomdevice
 {
     int id;
     void __iomem* registers;
+    struct doombuffer* cmd;
+
     struct pci_dev* pci_device;
     struct device* chr_device;
+
     struct mutex lock;
     struct semaphore wait_pong;
 };
@@ -51,7 +54,7 @@ struct doomfile
         } name;
     } buffers;
 
-    struct doombuffer* cmd;
+    struct doomdev2_cmd* raw_cmds;
 
     struct mutex lock;
     struct doomdevice* device;

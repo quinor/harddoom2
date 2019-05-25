@@ -53,21 +53,22 @@ static int doom_open(struct inode *ino, struct file *file)
     df->device = devices[MINOR(ino->i_rdev)];
     mutex_init(&df->lock);
 
-    if (IS_ERR(df->cmd = alloc_pagetable(df->device, sizeof(cmd_t)*DOOMDEV_MAX_CMD_COUNT, 0, 0)))
+    if (0 == (df->raw_cmds = vmalloc(sizeof(struct doomdev2_cmd)*DOOMDEV_MAX_CMD_COUNT)))
     {
-        err = PTR_ERR(df->cmd);
-        goto err_cmd_init;
+        err = ENOMEM;
+        goto err_rawcmd_alloc;
     }
 
     file->private_data = df;
 
     return 0;
 
-    free_pagetable(df->cmd);
-err_cmd_init:
+    vfree(df->raw_cmds);
+err_rawcmd_alloc:
 
     kmem_cache_free(doomfile_cache, df);
 err_cache_alloc:
+
     return err;
 }
 
@@ -83,7 +84,7 @@ static int doom_release(struct inode *ino, struct file *file)
         if (df->buffers.array[i] != 0)
             fput(df->buffers.array[i]->file);
 
-    free_pagetable(df->cmd);
+    vfree(df->raw_cmds);
     kmem_cache_free(doomfile_cache, df);
     return 0;
 }
@@ -131,11 +132,6 @@ err_alloc_pagetable:
     return -err;
 }
 
-void destroy_buffer(struct doombuffer* buf)
-{
-    kmem_cache_free(doombuffer_cache, buf);
-}
-
 
 static long doom_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
@@ -150,12 +146,12 @@ static long doom_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         case DOOMDEV2_IOCTL_CREATE_SURFACE:
         {
             struct doomdev2_ioctl_create_surface ioctl_surf;
-            if ((err = copy_from_user(
+            if (copy_from_user(
                 &ioctl_surf,
                 (const void __user *)arg,
                 sizeof(struct doomdev2_ioctl_create_surface)
-            )))
-                return -err;
+            ))
+                return -EFAULT;
             size = ioctl_surf.width*ioctl_surf.height;
             width = ioctl_surf.width;
             height = ioctl_surf.height;
@@ -174,12 +170,12 @@ static long doom_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         case DOOMDEV2_IOCTL_CREATE_BUFFER:
         {
             struct doomdev2_ioctl_create_buffer ioctl_buffer;
-            if ((err = copy_from_user(
+            if (copy_from_user(
                 &ioctl_buffer,
                 (const void __user *)arg,
                 sizeof(struct doomdev2_ioctl_create_buffer)
-            )))
-                return -err;
+            ))
+                return -EFAULT;
 
             size = ioctl_buffer.size;
             width = 0;
@@ -195,19 +191,21 @@ static long doom_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         }
         case DOOMDEV2_IOCTL_SETUP:
         {
-            // TODO: repair partial fail?
             uint32_t fds[7];
             int i;
 
             err = 0;
             mutex_lock(&df->lock);
 
-            if ((err = copy_from_user(
+            if (copy_from_user(
                 &fds,
                 (const void __user *)arg,
                 sizeof(uint32_t)*7
-            )))
+            ))
+            {
+                err = EFAULT;
                 goto ioctl_fail;
+            }
 
             for (i=0; i<7; i++)
                 if (fds[i] != -1)
@@ -264,6 +262,8 @@ static void write_cmd(struct doombuffer* cmdbuf, cmd_t *command, size_t pos)
 
 static int decode_cmd(struct doomfile* df, cmd_t* decoded_cmd, struct doomdev2_cmd* raw_cmd)
 {
+    int i;
+
     #define CHECK(cond) if(!(cond)) {return EINVAL;}
 
     #define IN_SURFACE(x, y, surf) ((surf) != 0 && 0 <= (x) && (x) <= (surf)->width && 0 <= (y) && (y) <= (surf)->height)
@@ -277,8 +277,7 @@ static int decode_cmd(struct doomfile* df, cmd_t* decoded_cmd, struct doomdev2_c
     #define IS_TRANMAP(surf) ((surf) != 0 && (surf)->size == (1<<16))
 
     #define CONVERT_FLAGS(flags) ((((flags) & DOOMDEV2_CMD_FLAGS_TRANSLATE) ? HARDDOOM2_CMD_FLAG_TRANSLATION : 0) | (((flags) & DOOMDEV2_CMD_FLAGS_COLORMAP) ? HARDDOOM2_CMD_FLAG_COLORMAP : 0) | (((flags) & DOOMDEV2_CMD_FLAGS_TRANMAP) ? HARDDOOM2_CMD_FLAG_TRANMAP : 0))
-    // TODO: check params
-    int i;
+
     for (i=0; i<8; i++)
         decoded_cmd->w[i] = 0;
 
@@ -608,20 +607,21 @@ static int decode_cmd(struct doomfile* df, cmd_t* decoded_cmd, struct doomdev2_c
 
     #undef CHECK
     #undef IN_SURFACE
+    #undef IN_TEXTURE
     #undef IN_FLAT
     #undef IN_COLORMAP
     #undef IS_TRANMAP
+    #undef CONVERT_FLAGS
 }
 
-struct doomdev2_cmd raw_cmds[DOOMDEV_MAX_CMD_COUNT-1];
 
-ssize_t doom_write(struct file *file, const char __user *user_data, size_t count, loff_t *off)
+static ssize_t doom_write(struct file *file, const char __user *user_data, size_t count, loff_t *off)
 {
     int err;
-    int cmd_c = 0;
+    uint32_t cmd_c = 0;
+    uint32_t start;
     struct doomfile* df;
     cmd_t cur_cmd = {0};
-    void __iomem* reg_enable;
 
     df = file->private_data;
 
@@ -633,15 +633,22 @@ ssize_t doom_write(struct file *file, const char __user *user_data, size_t count
 
     count /= sizeof(struct doomdev2_cmd);
 
-    if (count >= DOOMDEV_MAX_CMD_COUNT)
-        count = DOOMDEV_MAX_CMD_COUNT-1;
+    mutex_lock(&df->lock);
+    mutex_lock(&df->device->lock);
 
-    if ((err = -copy_from_user(
-        &raw_cmds,
+    // space for setup and one free space for the cyclic buffer indices
+    if (count >= DOOMDEV_MAX_CMD_COUNT-1)
+        count = DOOMDEV_MAX_CMD_COUNT-2;
+
+    if (copy_from_user(
+        df->raw_cmds,
         user_data,
         sizeof(struct doomdev2_cmd)*count
-    )))
-        goto err_end;
+    ))
+    {
+        err = -EFAULT;
+        goto err_end_lock;
+    }
 
     // decode setup
     cur_cmd.w[0] = HARDDOOM2_CMD_W0_SETUP(
@@ -676,42 +683,41 @@ ssize_t doom_write(struct file *file, const char __user *user_data, size_t count
         cur_cmd.w[7] = df->buffers.name.tranmap->dev_pagetable_handle;
 
 
+    start = ioread32(df->device->registers+HARDDOOM2_CMD_WRITE_IDX);
 
-    write_cmd(df->cmd, &cur_cmd, cmd_c++);
+    write_cmd(df->device->cmd, &cur_cmd, start);
+    start = (start+1)&(DOOMDEV_MAX_CMD_COUNT-1);
+    cmd_c++;
 
     // decode rest of the commands
     while (cmd_c <= count)
     {
-        if ((err = -decode_cmd(df, &cur_cmd, &raw_cmds[cmd_c-1])))
-            goto err_end;
+        if ((err = -decode_cmd(df, &cur_cmd, &df->raw_cmds[cmd_c-1])))
+            goto err_end_lock;
 
          // last command
         if (cmd_c == count)
             cur_cmd.w[0] |= HARDDOOM2_CMD_FLAG_PING_SYNC;
 
-        write_cmd(df->cmd, &cur_cmd, cmd_c++);
+        write_cmd(df->device->cmd, &cur_cmd, start);
+        start = (start+1)&(DOOMDEV_MAX_CMD_COUNT-1);
+        cmd_c++;
     }
 
-    mutex_lock(&df->device->lock);
-
-    iowrite32(df->cmd->dev_pagetable_handle, df->device->registers+HARDDOOM2_CMD_PT);
-    iowrite32(2*DOOMDEV_MAX_CMD_COUNT, df->device->registers+HARDDOOM2_CMD_SIZE);
-    iowrite32(0, df->device->registers+HARDDOOM2_CMD_READ_IDX);
-    iowrite32(cmd_c, df->device->registers+HARDDOOM2_CMD_WRITE_IDX);
-
-    reg_enable = df->device->registers+HARDDOOM2_ENABLE;
-
-    iowrite32(HARDDOOM2_ENABLE_CMD_FETCH|ioread32(reg_enable), reg_enable);
+    iowrite32(start, df->device->registers+HARDDOOM2_CMD_WRITE_IDX);
     down(&df->device->wait_pong);
     // TODO: check for fails
-    iowrite32((~HARDDOOM2_ENABLE_CMD_FETCH)&ioread32(reg_enable), reg_enable);
 
     mutex_unlock(&df->device->lock);
+    mutex_unlock(&df->lock);
 
     return (cmd_c-1)*sizeof(struct doomdev2_cmd);
 
-err_end:
+err_end_lock:
+    mutex_unlock(&df->device->lock);
+    mutex_unlock(&df->lock);
 
+err_end:
     return err;
 }
 

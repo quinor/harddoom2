@@ -246,11 +246,11 @@ static ssize_t buffer_write(struct file *file, const char __user *user_data, siz
         BUG_ON((pos>>12) >= buf->page_c);
         BUG_ON((pos & (PAGE_SIZE-1)) + copy_end-pos > 4096);
 
-        if ((ret = copy_from_user(
+        if (copy_from_user(
             buf->usr_pagetable[pos>>12]+(pos & (PAGE_SIZE-1)),
             user_data+pos-start,
             copy_end-pos
-        )))
+        ))
         {
             *off = pos;
             if (pos != start)
