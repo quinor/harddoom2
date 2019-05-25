@@ -32,7 +32,6 @@ struct doomdevice
     struct pci_dev* pci_device;
     struct device* chr_device;
     struct mutex lock;
-    int irq_handle;
 };
 
 struct doomfile

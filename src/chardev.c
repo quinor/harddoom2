@@ -14,7 +14,7 @@ static dev_t doom_major;
 static struct cdev doom_cdev;
 
 static struct class doom_class = {
-    .name = "harddoom2",
+    .name = "doomdev",
     .owner = THIS_MODULE,
 };
 
@@ -254,9 +254,11 @@ static void write_cmd(struct doombuffer* cmdbuf, cmd_t *command, size_t pos)
     cmd_t* page;
 
     pos = pos*sizeof(cmd_t);
-    // printk(KERN_INFO DOOMHDR "cmd written to %lx (shifted %lx)\n", pos, pos >> 12);
+    BUG_ON(pos>>12 >= cmdbuf->page_c);
+    BUG_ON((pos & (PAGE_SIZE-1)) + sizeof(cmd_t) > PAGE_SIZE);
+
     page = (cmd_t*)(cmdbuf->usr_pagetable[pos >> 12]);
-    page[pos&(PAGE_SIZE-1)] = *command;
+    page[(pos&(PAGE_SIZE-1))/sizeof(cmd_t)] = *command;
 }
 
 
@@ -264,25 +266,89 @@ static int decode_cmd(struct doomfile* df, cmd_t* decoded_cmd, struct doomdev2_c
 {
     #define CHECK(cond) if(!(cond)) {return EINVAL;}
 
-    #define IN_SURFACE(x, y, surf) (0 <= (x) && (x) <= (surf)->width && 0 <= (y) && (y) <= (surf)->height)
+    #define IN_SURFACE(x, y, surf) ((surf) != 0 && 0 <= (x) && (x) <= (surf)->width && 0 <= (y) && (y) <= (surf)->height)
+
+    #define IS_TEXTURE(surf) ((surf) != 0)
+
+    #define IN_FLAT(idx, surf) ((surf) != 0 && 0 <= (idx) && (idx) < (surf)->page_c)
+
+    #define IN_COLORMAP(idx, surf) ((surf) != 0 && 0 <= (idx) && (idx) < ((surf)->size >> 8))
+
+    #define IS_TRANMAP(surf) ((surf) != 0 && (surf)->size == (1<<16))
+
+    #define CONVERT_FLAGS(flags) ((((flags) & DOOMDEV2_CMD_FLAGS_TRANSLATE) ? HARDDOOM2_CMD_FLAG_TRANSLATION : 0) | (((flags) & DOOMDEV2_CMD_FLAGS_COLORMAP) ? HARDDOOM2_CMD_FLAG_COLORMAP : 0) | (((flags) & DOOMDEV2_CMD_FLAGS_TRANMAP) ? HARDDOOM2_CMD_FLAG_TRANMAP : 0))
     // TODO: check params
     int i;
     for (i=0; i<8; i++)
         decoded_cmd->w[i] = 0;
 
+    decoded_cmd->w[0] = HARDDOOM2_CMD_W0(HARDDOOM2_CMD_TYPE_SETUP, 0); // default NOP
+
     switch(raw_cmd->type)
     {
-        case DOOMDEV2_CMD_TYPE_FILL_RECT:
+        case DOOMDEV2_CMD_TYPE_COPY_RECT:
         {
+            struct doomdev2_cmd_copy_rect cur;
+            cur = raw_cmd->copy_rect;
+
             CHECK(IN_SURFACE(
-                raw_cmd->fill_rect.pos_x,
-                raw_cmd->fill_rect.pos_y,
+                cur.pos_src_x,
+                cur.pos_src_y,
+                df->buffers.name.surf_src
+            ))
+
+            CHECK(IN_SURFACE(
+                cur.pos_src_x+cur.width,
+                cur.pos_src_y+cur.height,
+                df->buffers.name.surf_src
+            ))
+
+            CHECK(IN_SURFACE(
+                cur.pos_dst_x,
+                cur.pos_dst_y,
                 df->buffers.name.surf_dst
             ))
 
             CHECK(IN_SURFACE(
-                raw_cmd->fill_rect.pos_x+raw_cmd->fill_rect.width,
-                raw_cmd->fill_rect.pos_y+raw_cmd->fill_rect.height,
+                cur.pos_dst_x+cur.width,
+                cur.pos_dst_y+cur.height,
+                df->buffers.name.surf_dst
+            ))
+
+            decoded_cmd->w[0] = HARDDOOM2_CMD_W0(
+                HARDDOOM2_CMD_TYPE_COPY_RECT,
+                (df->buffers.name.surf_dst == df->buffers.name.surf_src ? HARDDOOM2_CMD_FLAG_INTERLOCK : 0)
+            );
+            decoded_cmd->w[2] = HARDDOOM2_CMD_W2(
+                cur.pos_src_x,
+                cur.pos_src_y,
+                0
+            );
+            decoded_cmd->w[3] = HARDDOOM2_CMD_W3(
+                cur.pos_dst_x,
+                cur.pos_dst_y
+            );
+            decoded_cmd->w[6] = HARDDOOM2_CMD_W6_A(
+                cur.width,
+                cur.height,
+                0
+            );
+            return 0;
+        }
+        case DOOMDEV2_CMD_TYPE_FILL_RECT:
+        {
+            struct doomdev2_cmd_fill_rect cur;
+            cur = raw_cmd->fill_rect;
+
+            CHECK(IN_SURFACE(
+                cur.pos_x,
+                cur.pos_y,
+                df->buffers.name.surf_dst
+            ))
+
+            CHECK(IN_SURFACE(
+                cur.pos_x+cur.width,
+                cur.pos_y+cur.height,
                 df->buffers.name.surf_dst
             ))
 
@@ -291,28 +357,31 @@ static int decode_cmd(struct doomfile* df, cmd_t* decoded_cmd, struct doomdev2_c
                 0
             );
             decoded_cmd->w[2] = HARDDOOM2_CMD_W2(
-                raw_cmd->fill_rect.pos_x,
-                raw_cmd->fill_rect.pos_y,
+                cur.pos_x,
+                cur.pos_y,
                 0
             );
             decoded_cmd->w[6] = HARDDOOM2_CMD_W6_A(
-                raw_cmd->fill_rect.width,
-                raw_cmd->fill_rect.height,
-                raw_cmd->fill_rect.fill_color
+                cur.width,
+                cur.height,
+                cur.fill_color
             );
             return 0;
         }
         case DOOMDEV2_CMD_TYPE_DRAW_LINE:
         {
+            struct doomdev2_cmd_draw_line cur;
+            cur = raw_cmd->draw_line;
+
             CHECK(IN_SURFACE(
-                raw_cmd->draw_line.pos_a_x,
-                raw_cmd->draw_line.pos_a_y,
+                cur.pos_a_x,
+                cur.pos_a_y,
                 df->buffers.name.surf_dst
             ))
 
             CHECK(IN_SURFACE(
-                raw_cmd->draw_line.pos_b_x,
-                raw_cmd->draw_line.pos_b_y,
+                cur.pos_b_x,
+                cur.pos_b_y,
                 df->buffers.name.surf_dst
             ))
 
@@ -321,29 +390,227 @@ static int decode_cmd(struct doomfile* df, cmd_t* decoded_cmd, struct doomdev2_c
                 0
             );
             decoded_cmd->w[2] = HARDDOOM2_CMD_W2(
-                raw_cmd->draw_line.pos_a_x,
-                raw_cmd->draw_line.pos_a_y,
+                cur.pos_a_x,
+                cur.pos_a_y,
                 0
             );
             decoded_cmd->w[3] = HARDDOOM2_CMD_W3(
-                raw_cmd->draw_line.pos_b_x,
-                raw_cmd->draw_line.pos_b_y
+                cur.pos_b_x,
+                cur.pos_b_y
             );
             decoded_cmd->w[6] = HARDDOOM2_CMD_W6_A(
                 0, 0,
-                raw_cmd->draw_line.fill_color
+                cur.fill_color
             );
+            return 0;
+        }
+        case DOOMDEV2_CMD_TYPE_DRAW_BACKGROUND:
+        {
+            struct doomdev2_cmd_draw_background cur;
+            cur = raw_cmd->draw_background;
+
+            CHECK(IN_SURFACE(
+                cur.pos_x,
+                cur.pos_y,
+                df->buffers.name.surf_dst
+            ))
+
+            CHECK(IN_SURFACE(
+                cur.pos_x+cur.width,
+                cur.pos_y+cur.height,
+                df->buffers.name.surf_dst
+            ))
+
+            CHECK(IN_FLAT(cur.flat_idx, df->buffers.name.flat))
+
+            decoded_cmd->w[0] = HARDDOOM2_CMD_W0(
+                HARDDOOM2_CMD_TYPE_DRAW_BACKGROUND,
+                0
+            );
+            decoded_cmd->w[2] = HARDDOOM2_CMD_W2(
+                cur.pos_x,
+                cur.pos_y,
+                cur.flat_idx
+            );
+            decoded_cmd->w[6] = HARDDOOM2_CMD_W6_A(
+                cur.width,
+                cur.height,
+                0
+            );
+            return 0;
+        }
+        case DOOMDEV2_CMD_TYPE_DRAW_COLUMN:
+        {
+            struct doomdev2_cmd_draw_column cur;
+            uint32_t flags;
+            cur = raw_cmd->draw_column;
+
+            flags = CONVERT_FLAGS(cur.flags);
+
+            CHECK(IN_SURFACE(
+                cur.pos_x,
+                cur.pos_a_y,
+                df->buffers.name.surf_dst
+            ))
+
+            CHECK(IN_SURFACE(
+                cur.pos_x,
+                cur.pos_b_y,
+                df->buffers.name.surf_dst
+            ))
+
+            CHECK(IS_TEXTURE(df->buffers.name.texture))
+
+            if (flags & HARDDOOM2_CMD_FLAG_TRANSLATION)
+                CHECK(IN_COLORMAP(cur.translation_idx, df->buffers.name.translation))
+
+            if (flags & HARDDOOM2_CMD_FLAG_COLORMAP)
+                CHECK(IN_COLORMAP(cur.colormap_idx, df->buffers.name.colormap))
+
+            if (flags & HARDDOOM2_CMD_FLAG_TRANMAP)
+                CHECK(IS_TRANMAP(df->buffers.name.tranmap))
+
+            decoded_cmd->w[0] = HARDDOOM2_CMD_W0(
+                HARDDOOM2_CMD_TYPE_DRAW_COLUMN,
+                flags
+            );
+            decoded_cmd->w[1] = HARDDOOM2_CMD_W1(
+                (flags & HARDDOOM2_CMD_FLAG_TRANSLATION ? cur.translation_idx : 0),
+                (flags & HARDDOOM2_CMD_FLAG_COLORMAP ? cur.colormap_idx : 0)
+            );
+            decoded_cmd->w[2] = HARDDOOM2_CMD_W2(
+                cur.pos_x,
+                cur.pos_a_y,
+                0
+            );
+            decoded_cmd->w[3] = HARDDOOM2_CMD_W3(
+                cur.pos_x,
+                cur.pos_b_y
+            );
+            decoded_cmd->w[4] = cur.ustart;
+            decoded_cmd->w[5] = cur.ustep;
+            decoded_cmd->w[6] = HARDDOOM2_CMD_W6_B(cur.texture_offset);
+            decoded_cmd->w[7] = HARDDOOM2_CMD_W7_B(
+                (df->buffers.name.texture->size >> 6)-1,
+                cur.texture_height
+            );
+
+            return 0;
+        }
+        case DOOMDEV2_CMD_TYPE_DRAW_FUZZ:
+        {
+            struct doomdev2_cmd_draw_fuzz cur;
+            cur = raw_cmd->draw_fuzz;
+
+            CHECK(cur.fuzz_pos < 56 && cur.fuzz_pos >= 0)
+
+            CHECK(IN_SURFACE(
+                cur.pos_x,
+                cur.pos_a_y,
+                df->buffers.name.surf_dst
+            ))
+
+            CHECK(IN_SURFACE(
+                cur.pos_x,
+                cur.pos_b_y,
+                df->buffers.name.surf_dst
+            ))
+
+            CHECK(cur.fuzz_start <= cur.pos_a_y && cur.pos_a_y <= cur.pos_b_y
+                && cur.pos_b_y <= cur.fuzz_end)
+
+            CHECK(IN_COLORMAP(cur.colormap_idx, df->buffers.name.colormap))
+
+            decoded_cmd->w[0] = HARDDOOM2_CMD_W0(
+                HARDDOOM2_CMD_TYPE_DRAW_FUZZ,
+                0
+            );
+            decoded_cmd->w[1] = HARDDOOM2_CMD_W1(
+                0,
+                cur.colormap_idx
+            );
+            decoded_cmd->w[2] = HARDDOOM2_CMD_W2(
+                cur.pos_x,
+                cur.pos_a_y,
+                0
+            );
+            decoded_cmd->w[3] = HARDDOOM2_CMD_W3(
+                cur.pos_x,
+                cur.pos_b_y
+            );
+            decoded_cmd->w[6] = HARDDOOM2_CMD_W6_C(
+                cur.fuzz_start,
+                cur.fuzz_end,
+                cur.fuzz_pos
+            );
+
+            return 0;
+        }
+        case DOOMDEV2_CMD_TYPE_DRAW_SPAN:
+        {
+            struct doomdev2_cmd_draw_span cur;
+            uint32_t flags;
+            cur = raw_cmd->draw_span;
+
+            flags = CONVERT_FLAGS(cur.flags);
+
+            CHECK(IN_SURFACE(
+                cur.pos_a_x,
+                cur.pos_y,
+                df->buffers.name.surf_dst
+            ))
+
+            CHECK(IN_SURFACE(
+                cur.pos_b_x,
+                cur.pos_y,
+                df->buffers.name.surf_dst
+            ))
+
+            CHECK(IN_FLAT(cur.flat_idx, df->buffers.name.flat))
+
+            if (flags & HARDDOOM2_CMD_FLAG_TRANSLATION)
+                CHECK(IN_COLORMAP(cur.translation_idx, df->buffers.name.translation))
+
+            if (flags & HARDDOOM2_CMD_FLAG_COLORMAP)
+                CHECK(IN_COLORMAP(cur.colormap_idx, df->buffers.name.colormap))
+
+            if (flags & HARDDOOM2_CMD_FLAG_TRANMAP)
+                CHECK(IS_TRANMAP(df->buffers.name.tranmap))
+
+            decoded_cmd->w[0] = HARDDOOM2_CMD_W0(
+                HARDDOOM2_CMD_TYPE_DRAW_SPAN,
+                flags
+            );
+            decoded_cmd->w[1] = HARDDOOM2_CMD_W1(
+                (flags & HARDDOOM2_CMD_FLAG_TRANSLATION ? cur.translation_idx : 0),
+                (flags & HARDDOOM2_CMD_FLAG_COLORMAP ? cur.colormap_idx : 0)
+            );
+            decoded_cmd->w[2] = HARDDOOM2_CMD_W2(
+                cur.pos_a_x,
+                cur.pos_y,
+                0
+            );
+            decoded_cmd->w[3] = HARDDOOM2_CMD_W3(
+                cur.pos_b_x,
+                cur.pos_y
+            );
+            decoded_cmd->w[4] = cur.ustart;
+            decoded_cmd->w[5] = cur.ustep;
+            decoded_cmd->w[6] = cur.vstart;
+            decoded_cmd->w[7] = cur.vstep;
             return 0;
         }
         default:
         {
-            decoded_cmd->w[0] = HARDDOOM2_CMD_W0(HARDDOOM2_CMD_TYPE_SETUP, 0); // NOP
-            return 0;
+            return EINVAL;
         }
     }
 
     #undef CHECK
     #undef IN_SURFACE
+    #undef IN_FLAT
+    #undef IN_COLORMAP
+    #undef IS_TRANMAP
 }
 
 struct doomdev2_cmd raw_cmds[DOOMDEV_MAX_CMD_COUNT-1];
@@ -357,36 +624,25 @@ ssize_t doom_write(struct file *file, const char __user *user_data, size_t count
     cmd_t cur_cmd = {0};
     void __iomem* reg_enable;
 
-    // printk(KERN_INFO DOOMHDR "send attempt of %d\n", count);
-
     df = file->private_data;
 
     if (count % sizeof(struct doomdev2_cmd) != 0)
     {
         err = -EINVAL;
-        // printk(KERN_INFO DOOMHDR "fail1\n");
         goto err_end;
     }
 
     count /= sizeof(struct doomdev2_cmd);
 
-    // if (count >= 1000)
-    //     printk(KERN_INFO DOOMHDR "big count is %d\n", count);
     if (count >= DOOMDEV_MAX_CMD_COUNT)
-    {
-        printk(KERN_INFO DOOMHDR "truncated count to %d from %d\n", DOOMDEV_MAX_CMD_COUNT-1, count);
         count = DOOMDEV_MAX_CMD_COUNT-1;
-    }
 
     if ((err = -copy_from_user(
         &raw_cmds,
         user_data,
         sizeof(struct doomdev2_cmd)*count
     )))
-    {
-        // printk(KERN_INFO DOOMHDR "fail2\n");
         goto err_end;
-    }
 
     // decode setup
     cur_cmd.w[0] = HARDDOOM2_CMD_W0_SETUP(
@@ -404,74 +660,52 @@ ssize_t doom_write(struct file *file, const char __user *user_data, size_t count
         df->buffers.name.surf_dst != 0 ? df->buffers.name.surf_dst->width : 0, //sdwidth
         df->buffers.name.surf_src != 0 ? df->buffers.name.surf_src->width : 0 //sswidth
     );
-    for (i=0; i<7; i++)
-        if (df->buffers.array[i] != 0)
-            cur_cmd.w[i+1] = df->buffers.array[i]->dev_pagetable_handle;
+
+    if (df->buffers.name.surf_dst != 0)
+        cur_cmd.w[1] = df->buffers.name.surf_dst->dev_pagetable_handle;
+    if (df->buffers.name.surf_src != 0)
+        cur_cmd.w[2] = df->buffers.name.surf_src->dev_pagetable_handle;
+    if (df->buffers.name.texture != 0)
+        cur_cmd.w[3] = df->buffers.name.texture->dev_pagetable_handle;
+    if (df->buffers.name.flat != 0)
+        cur_cmd.w[4] = df->buffers.name.flat->dev_pagetable_handle;
+    if (df->buffers.name.translation != 0)
+        cur_cmd.w[5] = df->buffers.name.translation->dev_pagetable_handle;
+    if (df->buffers.name.colormap != 0)
+        cur_cmd.w[6] = df->buffers.name.colormap->dev_pagetable_handle;
+    if (df->buffers.name.tranmap != 0)
+        cur_cmd.w[7] = df->buffers.name.tranmap->dev_pagetable_handle;
+
+
 
     write_cmd(df->cmd, &cur_cmd, cmd_c++);
-
-    // printk(KERN_INFO DOOMHDR "count is %d, cmd_c is %d\n", count, cmd_c);
 
     // decode rest of the commands
     while (cmd_c <= count)
     {
         if ((err = -decode_cmd(df, &cur_cmd, &raw_cmds[cmd_c-1])))
-        {
-            printk(KERN_INFO DOOMHDR "fail3\n");
             goto err_end;
-        }
-        // printk(KERN_INFO DOOMHDR "args: %lx, %lx, %d\n", df->cmd, &cur_cmd, cmd_c);
         write_cmd(df->cmd, &cur_cmd, cmd_c++);
     }
 
-
     mutex_lock(&df->device->lock);
-
 
     iowrite32(df->cmd->dev_pagetable_handle, df->device->registers+HARDDOOM2_CMD_PT);
     iowrite32(0, df->device->registers+HARDDOOM2_CMD_READ_IDX);
     iowrite32(cmd_c, df->device->registers+HARDDOOM2_CMD_WRITE_IDX);
 
-    // TODO: run commands
     reg_enable = df->device->registers+HARDDOOM2_ENABLE;
     iowrite32(HARDDOOM2_ENABLE_CMD_FETCH|ioread32(reg_enable), reg_enable);
 
-    if (ioread32(reg_enable) != HARDDOOM2_ENABLE_ALL)
-    {
-        printk(KERN_INFO DOOMHDR "registers enabled %lx (fe error %lx)\n",
-            ioread32(reg_enable),
-            ioread32(df->device->registers+HARDDOOM2_FE_ERROR_CODE)
-        );
-        printk(KERN_INFO DOOMHDR "target surface of size %d by %d (size: %d)\n",
-            df->buffers.name.surf_dst->width,
-            df->buffers.name.surf_dst->height,
-            df->buffers.name.surf_dst->size
-        );
-
-        printk(KERN_INFO DOOMHDR "current command:\n\t%lx\n\t%lx\n\t%lx\n\t%lx\n\t%lx\n\t%lx\n\t%lx\n\t%lx\n",
-            ioread32(df->device->registers+HARDDOOM2_FE_REG(0)),
-            ioread32(df->device->registers+HARDDOOM2_FE_REG(1)),
-            ioread32(df->device->registers+HARDDOOM2_FE_REG(2)),
-            ioread32(df->device->registers+HARDDOOM2_FE_REG(3)),
-            ioread32(df->device->registers+HARDDOOM2_FE_REG(4)),
-            ioread32(df->device->registers+HARDDOOM2_FE_REG(5)),
-            ioread32(df->device->registers+HARDDOOM2_FE_REG(6)),
-            ioread32(df->device->registers+HARDDOOM2_FE_REG(7))
-        );
-    }
-
-    // TODO: wait for the ran commands
     while (ioread32(df->device->registers+HARDDOOM2_CMD_READ_IDX) != cmd_c);
 
     iowrite32((~HARDDOOM2_ENABLE_CMD_FETCH)&ioread32(reg_enable), reg_enable);
     mutex_unlock(&df->device->lock);
 
-    // printk(KERN_INFO DOOMHDR "succeeded with %d\n", (cmd_c-1)*sizeof(struct doomdev2_cmd));
     return (cmd_c-1)*sizeof(struct doomdev2_cmd);
 
 err_end:
 
-    // printk(KERN_INFO DOOMHDR "failed with %d\n", err);
     return err;
 }
 
@@ -520,7 +754,7 @@ int chardev_init(void)
     }
 
     // region
-    if ((err = alloc_chrdev_region(&doom_major, 0, MAX_DEVICE_COUNT, "harddoom2")))
+    if ((err = alloc_chrdev_region(&doom_major, 0, MAX_DEVICE_COUNT, "doomdev")))
         goto err_alloc;
 
     // init and add the device

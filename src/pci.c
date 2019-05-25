@@ -109,9 +109,12 @@ static int doomdev_probe (struct pci_dev *dev, const struct pci_device_id *dev_i
     if ((err = pci_set_dma_mask(dev, DMA_BIT_MASK(DOOMDEV_ADDRESS_LENGTH))))
         goto err_pci_dma_mask;
 
+    // if ((err = pci_set_consistent_dma_mask(dev, DMA_BIT_MASK(DOOMDEV_ADDRESS_LENGTH))))
+    //     goto err_pci_dma_mask;
+
     // Interrupts
-    if ((err = doomdev->irq_handle = request_irq(
-        doomdev->pci_device->irq, doomdev_irq_handler, IRQF_SHARED, DRIVER_NAME, dev)))
+    if ((err = request_irq(
+        dev->irq, doomdev_irq_handler, IRQF_SHARED, DRIVER_NAME, doomdev)))
         goto err_irq;
 
     // Boot the device
@@ -143,7 +146,7 @@ static int doomdev_probe (struct pci_dev *dev, const struct pci_device_id *dev_i
 err_chardev_create:
     iowrite32(0, doomdev->registers+HARDDOOM2_ENABLE);
     iowrite32(0, doomdev->registers+HARDDOOM2_INTR_ENABLE);
-    free_irq(doomdev->irq_handle, doomdev->pci_device);
+    free_irq(dev->irq, doomdev);
 
 err_irq:
 err_pci_dma_mask:
@@ -182,7 +185,7 @@ static void doomdev_remove (struct pci_dev *dev)
 
     iowrite32(0, doomdev->registers+HARDDOOM2_INTR_ENABLE);
     iowrite32(0, doomdev->registers+HARDDOOM2_ENABLE);
-    free_irq(doomdev->irq_handle, doomdev->pci_device);
+    free_irq(dev->irq, doomdev);
 
     pci_clear_master(dev);
     pci_iounmap(dev, doomdev->registers);

@@ -32,8 +32,6 @@ struct doombuffer* alloc_pagetable(struct doomdevice* device, uint32_t size, uin
         goto err_cache_alloc;
     }
 
-    // printk(KERN_INFO DOOMHDR "doombuffer at  %lx\n", buf);
-
     buf->size = size;
     buf->width = width;
     buf->height = height;
@@ -50,6 +48,8 @@ struct doombuffer* alloc_pagetable(struct doomdevice* device, uint32_t size, uin
         err = ENOMEM;
         goto err_alloc_dev_pagetable;
     }
+
+    BUG_ON((temp_handle & 255) != 0);
 
     buf->dev_pagetable_handle = temp_handle >> 8;
 
@@ -72,6 +72,7 @@ struct doombuffer* alloc_pagetable(struct doomdevice* device, uint32_t size, uin
             err = ENOMEM;
             goto err_alloc_pages;
         }
+        BUG_ON((temp_handle & 255) != 0);
         buf->dev_pagetable[buf->page_c] = HARDDOOM2_PTE_VALID|HARDDOOM2_PTE_WRITABLE | (temp_handle >> 8);
         buf->page_c++;
     }
@@ -214,15 +215,10 @@ static ssize_t buffer_write(struct file *file, const char __user *user_data, siz
 
     mutex_lock(&buf->lock);
 
-    // printk(KERN_INFO DOOMHDR "write request of size %d...\n", count);
-    // printk(KERN_INFO DOOMHDR "buf stats: page_c %d, size %d, width %d, height %d\n",
-        // buf->page_c, buf->size, buf->width, buf->height);
-
     start = pos = *off;
 
     if (pos < 0 || pos > buf->size)
     {
-        // printk(KERN_INFO DOOMHDR "fail1\n");
         ret = -EFAULT;
         goto err_end;
     }
@@ -233,8 +229,6 @@ static ssize_t buffer_write(struct file *file, const char __user *user_data, siz
 
     if (pos == end)
     {
-        // printk(KERN_INFO DOOMHDR "count: %d buf->size: %d pos: %d\n", count, buf->size, pos);
-        // printk(KERN_INFO DOOMHDR "fail2\n");
         ret = -EFAULT;
         goto err_end;
     }
@@ -245,6 +239,9 @@ static ssize_t buffer_write(struct file *file, const char __user *user_data, siz
         copy_end = (pos + PAGE_SIZE)&(~(PAGE_SIZE-1));
         if (copy_end > end)
             copy_end = end;
+
+        BUG_ON(pos>>12 >= buf->page_c);
+        BUG_ON((pos & (PAGE_SIZE-1)) + copy_end-pos > 4096);
 
         if ((ret = copy_from_user(
             buf->usr_pagetable[pos>>12]+(pos & (PAGE_SIZE-1)),
@@ -257,7 +254,6 @@ static ssize_t buffer_write(struct file *file, const char __user *user_data, siz
                 ret = pos-start;
             else
                 ret = -EFAULT;
-            // printk(KERN_INFO DOOMHDR "fail3\n");
             goto err_end;
         }
 
@@ -267,12 +263,10 @@ static ssize_t buffer_write(struct file *file, const char __user *user_data, siz
 
     ret = pos-start;
 
-    // printk(KERN_INFO DOOMHDR "...wrote %d\n", ret);
     mutex_unlock(&buf->lock);
     return ret;
 
 err_end:
-    // printk(KERN_INFO DOOMHDR "failed with %d\n", ret);
     mutex_unlock(&buf->lock);
     return ret;
 }
