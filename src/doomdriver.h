@@ -35,6 +35,7 @@ struct doomdevice
     struct pci_dev* pci_device;
     struct device* chr_device;
 
+    int enabled;
     struct mutex lock;
     struct semaphore wait_pong;
 };

@@ -51,7 +51,12 @@ static irqreturn_t doomdev_irq_handler(int irq, void *dev)
         up(&doomdev->wait_pong);
 
     if (intr & (~HARDDOOM2_INTR_PONG_SYNC))
-        printk(KERN_INFO DOOMHDR "Interrupts caught: %x\n", intr);
+    {
+        doomdev->enabled = 0;
+        up(&doomdev->wait_pong);
+        printk(KERN_ERR DOOMHDR "Interrupts caught on device %d: %x\n", doomdev->id, intr);
+        printk(KERN_ERR DOOMHDR "Disabling the device %d, please restart it manually", doomdev->id);
+    }
 
     return IRQ_HANDLED;
 }
@@ -83,6 +88,7 @@ static int doomdev_probe (struct pci_dev *dev, const struct pci_device_id *dev_i
 
     doomdev->id = id;
     doomdev->pci_device = dev;
+    doomdev->enabled = 1;
     mutex_init(&doomdev->lock);
     sema_init(&doomdev->wait_pong, 0);
     devices[id] = doomdev;

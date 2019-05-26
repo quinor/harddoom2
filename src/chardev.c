@@ -639,6 +639,13 @@ static ssize_t doom_write(struct file *file, const char __user *user_data, size_
     mutex_lock(&df->lock);
     mutex_lock(&df->device->lock);
 
+    // that means that the device has crashed and does not accept commands
+    if (!df->device->enabled)
+    {
+        err = -EIO;
+        goto err_end_lock;
+    }
+
     // space for setup and one free space for the cyclic buffer indices
     if (count >= DOOMDEV_MAX_CMD_COUNT-1)
         count = DOOMDEV_MAX_CMD_COUNT-2;
@@ -709,7 +716,13 @@ static ssize_t doom_write(struct file *file, const char __user *user_data, size_
 
     iowrite32(start, df->device->registers+HARDDOOM2_CMD_WRITE_IDX);
     down(&df->device->wait_pong);
-    // TODO: check for fails
+
+    // that means that the device has crashed and does not accept commands, the operation has failed
+    if (!df->device->enabled)
+    {
+        err = -EIO;
+        goto err_end_lock;
+    }
 
     mutex_unlock(&df->device->lock);
     mutex_unlock(&df->lock);
