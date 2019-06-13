@@ -322,13 +322,13 @@ static int decode_cmd(struct doomfile* df, cmd_t* decoded_cmd, struct doomdev2_c
                 (df->buffers.name.surf_dst == df->buffers.name.surf_src ? HARDDOOM2_CMD_FLAG_INTERLOCK : 0)
             );
             decoded_cmd->w[2] = HARDDOOM2_CMD_W2(
-                cur.pos_src_x,
-                cur.pos_src_y,
+                cur.pos_dst_x,
+                cur.pos_dst_y,
                 0
             );
             decoded_cmd->w[3] = HARDDOOM2_CMD_W3(
-                cur.pos_dst_x,
-                cur.pos_dst_y
+                cur.pos_src_x,
+                cur.pos_src_y
             );
             decoded_cmd->w[6] = HARDDOOM2_CMD_W6_A(
                 cur.width,
